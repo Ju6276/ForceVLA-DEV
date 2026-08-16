@@ -129,9 +129,11 @@ class TimestampAlignedForceHistory(DataTransformFn):
             raise ValueError("Force timestamps must be monotonically nondecreasing")
 
         start_time = target_time - self.window_ms / 1000.0
-        # searchsorted(..., side='right') is important: samples after t_k can
-        # never enter the history, even when another modality has a later index.
-        begin = int(np.searchsorted(timestamps, start_time, side="left"))
+        # Use the half-open interval (t_k - window, t_k]. Excluding the left
+        # endpoint makes a 100 ms window contain exactly 20 regularly sampled
+        # values at 200 Hz, while side="right" at the target keeps the current
+        # sample and excludes every future sample.
+        begin = int(np.searchsorted(timestamps, start_time, side="right"))
         end = int(np.searchsorted(timestamps, target_time, side="right"))
         window = force[begin:end]
         if window.shape[0] > self.max_samples:

@@ -35,3 +35,20 @@ def test_timestamp_force_history_rejects_unsorted_timestamps():
                 "time": np.asarray(1.0),
             }
         )
+
+
+@pytest.mark.parametrize(("sampling_rate_hz", "expected_samples"), [(30, 3), (200, 20)])
+def test_timestamp_force_history_excludes_exact_left_boundary(sampling_rate_hz, expected_samples):
+    target_time = 1.0
+    # Include the exact t - 100 ms endpoint, which must be excluded from
+    # the half-open interval (t - 100 ms, t].
+    timestamps = target_time - np.arange(expected_samples, -1, -1) / sampling_rate_hz
+    force = np.arange(timestamps.size * 6, dtype=np.float32).reshape(timestamps.size, 6)
+    transform = transforms.TimestampAlignedForceHistory(
+        "force", "force_time", "time", window_ms=100, max_samples=expected_samples
+    )
+
+    result = transform({"force": force, "force_time": timestamps, "time": np.asarray(target_time)})
+
+    np.testing.assert_array_equal(result["force_history"], force[1:])
+    np.testing.assert_array_equal(result["force_history_mask"], np.ones(expected_samples, dtype=np.bool_))

@@ -90,7 +90,7 @@ Pi0_GuidanceConfig(
 Temporal modes expect each raw dataset item to retain `observation.force` as `[N, 6]`,
 `observation.force_timestamps` as `[N]`, and the VLA `timestamp` as a scalar (all timestamps in
 seconds). `LeRobotForcevlaDataConfig` exposes these key names. It extracts only samples in
-`[timestamp - window_ms, timestamp]`, keeps native-rate samples, and returns a left-padded history
+`(timestamp - window_ms, timestamp]`, keeps native-rate samples, and returns a left-padded history
 plus validity mask. FVLMoE, the Action Expert, action target, and training objective are unchanged.
 
 The released ForceVLA LeRobot data stores one wrench inside `observation.state` per 30 Hz frame.
