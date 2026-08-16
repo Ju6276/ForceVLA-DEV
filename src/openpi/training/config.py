@@ -986,6 +986,12 @@ _CONFIGS = [
             "./checkpoints/forcevla_usb_temporal_lora_aligned/forcevla_usb_temporal/49999/params",
             missing_regex=".*null_force_token.*",
         ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
         num_train_steps=10_000,
         # Freeze every parameter except the newly introduced null force token.
         # Restrict the filter to Params so non-parameter state such as Dropout

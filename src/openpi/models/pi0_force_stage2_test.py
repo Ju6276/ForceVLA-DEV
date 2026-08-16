@@ -44,6 +44,16 @@ def test_stage2a_filter_trains_only_null_force_token():
     assert set(frozen_state) == {"existing_teacher_weight"}
 
 
+def test_stage2a_schedule_matches_training_horizon():
+    config = training_config.get_config("forcevla_usb_temporal_stage2a_null")
+
+    assert config.num_train_steps == 10_000
+    assert config.lr_schedule.warmup_steps == 500
+    assert config.lr_schedule.peak_lr == 2.5e-5
+    assert config.lr_schedule.decay_steps == config.num_train_steps
+    assert config.lr_schedule.decay_lr == 2.5e-6
+
+
 def test_stage1_checkpoint_can_initialize_new_null_token():
     loaded = {
         "teacher": {"weight": np.ones((2,), dtype=np.float32)},

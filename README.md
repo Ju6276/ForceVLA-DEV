@@ -197,6 +197,9 @@ Because only `null_force_token` is trainable in Stage 2A, the stored Stage 1 ful
 is unchanged by optimization. The full/null/retain joint loss belongs to an optional Stage 2B if a
 single token is insufficient; it is deliberately not active in this config.
 
+Stage 2A uses a schedule matched to its shorter 10,000-step horizon: 500 warmup steps, peak learning
+rate `2.5e-5`, cosine decay over 10,000 steps, and final learning rate `2.5e-6`.
+
 For future native-rate datasets, the loader can keep LeRobot RGB/state/action rows at their original
 rate and join one timestamped NPZ force sidecar per episode. Each sidecar must use the same
 episode-relative clock as the LeRobot `timestamp` and contain `force: [M, 6]` plus
