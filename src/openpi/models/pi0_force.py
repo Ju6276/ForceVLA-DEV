@@ -270,10 +270,10 @@ class Pi0_Guidance(_model.BaseModel):
         *,
         train: bool = False,
     ) -> tuple[
-        at.Float[at.Array, "b s emb"],
+        at.Float[at.Array, "b s action_emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b 1 emb"],
+        at.Float[at.Array, "b 1 force_emb"],
     ]:
         input_mask = []
         ar_mask = []

@@ -552,6 +552,10 @@ class TrainConfig:
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
+    # By default frozen parameters are stored as bfloat16. A staged adaptation
+    # can override this independently from freeze_filter to preserve the exact
+    # dtypes of a source checkpoint while still freezing additional weights.
+    bfloat16_cast_filter: tyro.conf.Suppress[Filter | None] = None
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
@@ -984,7 +988,21 @@ _CONFIGS = [
         ),
         num_train_steps=10_000,
         # Freeze every parameter except the newly introduced null force token.
-        freeze_filter=nnx.Not(nnx_utils.PathRegex(".*null_force_token.*")),
+        # Restrict the filter to Params so non-parameter state such as Dropout
+        # PRNG keys is not cast to bfloat16 during train-state initialization.
+        freeze_filter=nnx.All(nnx.Param, nnx.Not(nnx_utils.PathRegex(".*null_force_token.*"))),
+        # Preserve the Stage 1 mixed-precision layout instead of casting newly
+        # frozen LoRA/TCN/fusion parameters to bfloat16.
+        bfloat16_cast_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=30,
+                window_ms=100,
+                history_source="aligned_state",
+            ),
+        ).get_freeze_filter(),
         ema_decay=None,
         batch_size=4,
     ),

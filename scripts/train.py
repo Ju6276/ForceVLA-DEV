@@ -102,8 +102,11 @@ def init_train_state(
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
-        # Convert frozen params to bfloat16.
-        params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+        # Convert the configured subset to bfloat16. This normally matches the
+        # frozen parameters, but staged adaptation may freeze more weights while
+        # retaining the source checkpoint's original mixed-precision layout.
+        cast_filter = config.freeze_filter if config.bfloat16_cast_filter is None else config.bfloat16_cast_filter
+        params = nnx_utils.state_map(params, cast_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
         return training_utils.TrainState(
             step=0,
@@ -265,7 +268,13 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            # Some parameter-efficient runs have no trainable matrix kernels;
+            # keep logging from aborting if a metric container reports a
+            # non-floating sentinel value.
+            info_str = ", ".join(
+                f"{k}={float(v):.4f}" if hasattr(v, "dtype") and jnp.issubdtype(v.dtype, jnp.number) else f"{k}={v}"
+                for k, v in reduced_info.items()
+            )
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []

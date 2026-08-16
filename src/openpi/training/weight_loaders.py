@@ -4,6 +4,7 @@ import re
 from typing import Protocol, runtime_checkable
 
 import flax.traverse_util
+import jax
 import numpy as np
 
 import openpi.models.model as _model
@@ -104,21 +105,33 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     Returns:
         A new dictionary with the merged parameters.
     """
-    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
-    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    # Keep tuple paths here: NNX lists (for example temporal TCN blocks) use
+    # integer path components, which cannot be flattened with sep="/".
+    flat_ref = flax.traverse_util.flatten_dict(params)
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params)
+    ref_paths = {tuple(map(str, path)): path for path in flat_ref}
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
     for k, v in flat_loaded.items():
-        if k in flat_ref:
-            result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
+        # Orbax restores integer list indices as string dictionary keys. Match
+        # paths canonically, then retain the reference tree's key types.
+        ref_key = ref_paths.get(tuple(map(str, k)))
+        if ref_key is not None:
+            ref_value = flat_ref[ref_key]
+            if jax.dtypes.issubdtype(ref_value.dtype, jax.dtypes.prng_key):
+                # PRNG state is not a learned teacher weight, and legacy
+                # checkpoints may store it using an incompatible uint32 form.
+                result[ref_key] = ref_value
+            else:
+                result[ref_key] = v.astype(ref_value.dtype) if v.dtype != ref_value.dtype else v
 
     flat_loaded.clear()
 
     # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
-    for k in {k for k in flat_ref if pattern.fullmatch(k)}:
+    for k in {k for k in flat_ref if pattern.fullmatch("/".join(map(str, k)))}:
         if k not in result:
             result[k] = flat_ref[k]
 
-    return flax.traverse_util.unflatten_dict(result, sep="/")
+    return flax.traverse_util.unflatten_dict(result)
