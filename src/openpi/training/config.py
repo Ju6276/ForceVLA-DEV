@@ -901,6 +901,54 @@ _CONFIGS = [
         ema_decay=None,
         batch_size=4,
     ),
+    TrainConfig(
+        name="forcevla_usb_lora",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="flexiv_insert_USB_inputForce",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
+    TrainConfig(
+        name="forcevla_usb_temporal_lora_aligned",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=30,
+                window_ms=100,
+                history_source="aligned_state",
+            ),
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="flexiv_insert_USB_inputForce",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=30,
+                window_ms=100,
+                history_source="aligned_state",
+            ),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
     #
     # Debugging configs.
     #

@@ -109,6 +109,8 @@ The named training configs make the mode explicit:
 ```text
 forcevla_lora                    = original instantaneous 6D force
 forcevla_temporal_lora_aligned   = RGB-aligned force history through the causal TCN (30 Hz default)
+forcevla_usb_lora                = USB insertion instantaneous baseline
+forcevla_usb_temporal_lora_aligned = USB insertion 30 Hz history through the causal TCN
 ```
 
 To train the continuous 30 Hz history variant on the released ForceVLA-style data:
@@ -128,6 +130,25 @@ the original instantaneous baseline. The aligned config defaults to the released
 For a dataset where RGB, state, and force are all 20 Hz, set `sampling_rate_hz=20`; the same 100 ms
 physical window then contains 2 force frames. The configured sampling rate must match the dataset
 FPS because the model input shape is static at initialization.
+
+For the released USB insertion task, point `HF_LEROBOT_HOME` at the directory containing
+`flexiv_insert_USB_inputForce`, then run the two controlled experiments separately:
+
+```bash
+export HF_LEROBOT_HOME=/home/d024/datasets/ForceVLA-real-data/data_lerobot
+
+python scripts/compute_norm_stats.py --config-name forcevla_usb_lora
+python scripts/train.py forcevla_usb_lora \
+    --exp-name=forcevla_usb_instantaneous \
+    --overwrite \
+    --batch_size=4
+
+python scripts/compute_norm_stats.py --config-name forcevla_usb_temporal_lora_aligned
+python scripts/train.py forcevla_usb_temporal_lora_aligned \
+    --exp-name=forcevla_usb_temporal \
+    --overwrite \
+    --batch_size=4
+```
 
 For future native-rate datasets, the loader can keep LeRobot RGB/state/action rows at their original
 rate and join one timestamped NPZ force sidecar per episode. Each sidecar must use the same
