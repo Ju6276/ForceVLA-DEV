@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import typing
 
 import einops
 import flax.nnx as nnx
@@ -80,6 +81,14 @@ class Pi0_GuidanceConfig(_model.BaseModelConfig):
     force_encoder: _force_encoder.ForceEncoderConfig = dataclasses.field(
         default_factory=_force_encoder.ForceEncoderConfig
     )
+    # Stage 1 keeps this disabled and uses the full force token. Stage 2A
+    # enables it and trains only the learned missing-force representation.
+    enable_null_force_token: bool = False
+    force_condition: typing.Literal["full", "null"] = "full"
+
+    def __post_init__(self):
+        if self.force_condition == "null" and not self.enable_null_force_token:
+            raise ValueError("force_condition='null' requires enable_null_force_token=True")
 
     @property
     @override
@@ -200,6 +209,12 @@ class Pi0_Guidance(_model.BaseModel):
             if config.force_encoder.type == "tcn"
             else None
         )
+        self.null_force_token = (
+            nnx.Param(jnp.zeros((paligemma_config.width,), dtype=jnp.float32))
+            if config.enable_null_force_token
+            else None
+        )
+        self.force_condition = config.force_condition
         print("paligemma_config.width: ", paligemma_config.width)
         self.limoe = nnx_bridge.ToNNX(
             _limoe.LIMoEBlock(
@@ -293,6 +308,11 @@ class Pi0_Guidance(_model.BaseModel):
 
     def encode_force(self, obs: _model.Observation, *, train: bool = False):
         """Return the single force token consumed by the unchanged LIMoE interface."""
+        if self.force_condition == "null":
+            if self.null_force_token is None:
+                raise ValueError("The null force condition requires a learned null_force_token")
+            return jnp.broadcast_to(self.null_force_token.value, (obs.state.shape[0], self.null_force_token.shape[0]))
+
         encoder_type = self.force_encoder_config.type
         if encoder_type == "instantaneous":
             # Preserve the original parameter name and exact computation.

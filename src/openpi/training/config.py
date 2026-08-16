@@ -24,6 +24,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -948,6 +949,42 @@ _CONFIGS = [
                 history_source="aligned_state",
             ),
         ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
+    TrainConfig(
+        name="forcevla_usb_temporal_stage2a_null",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=30,
+                window_ms=100,
+                history_source="aligned_state",
+            ),
+            enable_null_force_token=True,
+            force_condition="null",
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="flexiv_insert_USB_inputForce",
+            # Stage 2A uses the identical data representation as the Stage 1
+            # temporal Teacher, so it must reuse the same normalization stats.
+            assets=AssetsConfig(
+                assets_dir="./assets/forcevla_usb_temporal_lora_aligned",
+                asset_id="flexiv_insert_USB_inputForce_temporal_30hz",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # This path matches the Stage 1 command documented in README.md. Override
+        # --weight-loader.params-path when selecting a different Stage 1 checkpoint.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/forcevla_usb_temporal_lora_aligned/forcevla_usb_temporal/49999/params",
+            missing_regex=".*null_force_token.*",
+        ),
+        num_train_steps=10_000,
+        # Freeze every parameter except the newly introduced null force token.
+        freeze_filter=nnx.Not(nnx_utils.PathRegex(".*null_force_token.*")),
         ema_decay=None,
         batch_size=4,
     ),

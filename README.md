@@ -153,6 +153,50 @@ python scripts/train.py forcevla_usb_temporal_lora_aligned \
 The two USB configs use separate normalization asset IDs, so computing temporal statistics cannot
 overwrite the instantaneous baseline statistics (or vice versa).
 
+### Stage 2A: learned null-force token (after Stage 1)
+
+Stage 2A is prepared but is not part of the Stage 1 temporal-teacher experiment. It loads the trained
+Stage 1 temporal Teacher, adds one learned 2048D missing-force token at the existing force-fusion
+interface, freezes every existing Teacher parameter, and optimizes only that token with the original
+ForceVLA flow-matching objective. This follows the learned missing-modality-template idea of
+[Missing Modality Token (MMT)](https://openaccess.thecvf.com/content/CVPR2025W/MULA2025/html/Ramazanova_Exploring_Missing_Modality_in_Multimodal_Egocentric_Datasets_CVPRW_2025_paper.html),
+but does not yet enable MMT random-replace training or nominal-residual distillation.
+
+The default Stage 2A loader expects the checkpoint produced by the temporal command above:
+
+```text
+./checkpoints/forcevla_usb_temporal_lora_aligned/forcevla_usb_temporal/49999/params
+```
+
+After Stage 1 finishes, run:
+
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train.py \
+    forcevla_usb_temporal_stage2a_null \
+    --exp-name=forcevla_usb_stage2a_null \
+    --overwrite \
+    --batch_size=4
+```
+
+Do not recompute normalization statistics for Stage 2A. Its configuration deliberately reuses the
+Stage 1 temporal statistics from
+`./assets/forcevla_usb_temporal_lora_aligned/flexiv_insert_USB_inputForce_temporal_30hz` because the
+dataset and input representation are identical.
+
+To initialize from another Stage 1 checkpoint, override the path:
+
+```bash
+python scripts/train.py forcevla_usb_temporal_stage2a_null \
+    --exp-name=forcevla_usb_stage2a_null \
+    --weight-loader.params-path=/absolute/path/to/stage1/params \
+    --overwrite \
+    --batch_size=4
+```
+
+Because only `null_force_token` is trainable in Stage 2A, the stored Stage 1 full-force computation
+is unchanged by optimization. The full/null/retain joint loss belongs to an optional Stage 2B if a
+single token is insufficient; it is deliberately not active in this config.
+
 For future native-rate datasets, the loader can keep LeRobot RGB/state/action rows at their original
 rate and join one timestamped NPZ force sidecar per episode. Each sidecar must use the same
 episode-relative clock as the LeRobot `timestamp` and contain `force: [M, 6]` plus
