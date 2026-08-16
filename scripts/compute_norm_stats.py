@@ -100,11 +100,17 @@ def main(config_name: str, max_frames: int | None = None):
         )
 
     keys = ["state", "actions"]
+    if getattr(config.model, "force_encoder", None) is not None and config.model.force_encoder.type != "instantaneous":
+        keys.append("force_history")
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
-            stats[key].update(np.asarray(batch[key]))
+            values = np.asarray(batch[key])
+            if key == "force_history":
+                # Padding is a batching artifact, not a physical zero-force sample.
+                values = values[np.asarray(batch["force_history_mask"], dtype=np.bool_)]
+            stats[key].update(values)
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 

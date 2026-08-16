@@ -1,9 +1,12 @@
 import dataclasses
 from typing import ClassVar
+
 import einops
 import numpy as np
-from openpi import transforms  
+
+from openpi import transforms
 from openpi.models import model as _model
+
 
 def make_forcevla_example() -> dict:
     """Creates a random input example compatible with Flexiv config."""
@@ -38,6 +41,8 @@ class Forcevla_inputs(transforms.DataTransformFn):
     # Determines which model will be used.
     # Do not change this for your own dataset.
     model_type: _model.ModelType = _model.ModelType.PI0
+    use_force_history: bool = False
+    force_history_from_state: bool = False
 
     def __call__(self, data: dict) -> dict:
         # We only mask padding for pi0 model, not pi0-FAST. Do not change this for your own dataset.
@@ -48,7 +53,9 @@ class Forcevla_inputs(transforms.DataTransformFn):
         # since the pi0-FAST action_dim = 7, which is < state_dim = 8, so pad is skipped.
         # Keep this for your own dataset, but if your dataset stores the proprioceptive input
         # in a different key than "observation/state", you should change it below.
-        state = transforms.pad_to_dim(data["state"], self.action_dim)
+        raw_state = np.asarray(data["state"])
+        current_state = raw_state[-1] if self.force_history_from_state else raw_state
+        state = transforms.pad_to_dim(current_state, self.action_dim)
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference.
@@ -78,6 +85,24 @@ class Forcevla_inputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
             },
         }
+
+        if self.use_force_history:
+            if self.force_history_from_state:
+                if raw_state.ndim != 2 or raw_state.shape[-1] < 13:
+                    raise ValueError(f"Expected aligned state history [N, >=13], got {raw_state.shape}")
+                history = np.asarray(raw_state[:, 7:13], dtype=np.float32)
+                mask = np.ones(history.shape[:-1], dtype=np.bool_)
+            else:
+                if "force_history" not in data or "force_history_mask" not in data:
+                    raise ValueError("Temporal force mode requires force_history and force_history_mask")
+                history = np.asarray(data["force_history"], dtype=np.float32)
+                mask = np.asarray(data["force_history_mask"], dtype=np.bool_)
+            if history.ndim != 2 or history.shape[-1] != 6 or mask.shape != history.shape[:-1]:
+                raise ValueError(
+                    f"Expected force_history [N, 6] and mask [N], got {history.shape} and {mask.shape}"
+                )
+            inputs["force_history"] = history
+            inputs["force_history_mask"] = mask
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.

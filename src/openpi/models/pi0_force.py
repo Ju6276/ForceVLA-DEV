@@ -1,6 +1,6 @@
-import pdb
 import dataclasses
 import logging
+
 import einops
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+import openpi.models.force_encoder as _force_encoder
 import openpi.models.gemma as _gemma
 import openpi.models.limoe_simple as _limoe
 import openpi.models.siglip as _siglip
@@ -70,11 +71,15 @@ class Pi0_GuidanceConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    siglip_variant: str = "So400m/14"
 
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
     max_token_len: int = 48
+    force_encoder: _force_encoder.ForceEncoderConfig = dataclasses.field(
+        default_factory=_force_encoder.ForceEncoderConfig
+    )
 
     @property
     @override
@@ -91,6 +96,15 @@ class Pi0_GuidanceConfig(_model.BaseModelConfig):
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
+            history_spec = None
+            history_mask_spec = None
+            if self.force_encoder.type != "instantaneous":
+                history_spec = jax.ShapeDtypeStruct(
+                    [batch_size, self.force_encoder.max_history_samples, self.force_encoder.input_dim], jnp.float32
+                )
+                history_mask_spec = jax.ShapeDtypeStruct(
+                    [batch_size, self.force_encoder.max_history_samples], jnp.bool_
+                )
             observation_spec = _model.Observation(
                 images={
                     "base_0_rgb": image_spec,
@@ -103,6 +117,8 @@ class Pi0_GuidanceConfig(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                force_history=history_spec,
+                force_history_mask=history_mask_spec,
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
@@ -158,7 +174,7 @@ class Pi0_Guidance(_model.BaseModel):
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
-                variant="So400m/14",
+                variant=config.siglip_variant,
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
@@ -178,6 +194,12 @@ class Pi0_Guidance(_model.BaseModel):
         # )
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
         self.force_in_proj = nnx.Linear(6, paligemma_config.width, rngs=rngs)
+        self.force_encoder_config = config.force_encoder
+        self.temporal_force_encoder = (
+            _force_encoder.TemporalTCNForceEncoder(config.force_encoder, paligemma_config.width, rngs=rngs)
+            if config.force_encoder.type == "tcn"
+            else None
+        )
         print("paligemma_config.width: ", paligemma_config.width)
         self.limoe = nnx_bridge.ToNNX(
             _limoe.LIMoEBlock(
@@ -226,8 +248,18 @@ class Pi0_Guidance(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], at.Float[at.Array, "b 1 2*emb"]]:  # b t emb2
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        *,
+        train: bool = False,
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"],
+        at.Bool[at.Array, "b s"],
+        at.Bool[at.Array, " s"],
+        at.Float[at.Array, "b 1 emb"],
+    ]:
         input_mask = []
         ar_mask = []
         tokens = []
@@ -256,8 +288,22 @@ class Pi0_Guidance(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        force_tokens = self.force_in_proj(obs.state[:, 7:13])[:, None, :] # [b, 1, 2emb]
+        force_tokens = self.encode_force(obs, train=train)[:, None, :]
         return tokens, input_mask, ar_mask, force_tokens
+
+    def encode_force(self, obs: _model.Observation, *, train: bool = False):
+        """Return the single force token consumed by the unchanged LIMoE interface."""
+        encoder_type = self.force_encoder_config.type
+        if encoder_type == "instantaneous":
+            # Preserve the original parameter name and exact computation.
+            return self.force_in_proj(obs.state[:, 7:13])
+        if obs.force_history is None or obs.force_history_mask is None:
+            raise ValueError(f"force_history and force_history_mask are required for {encoder_type!r} mode")
+        if encoder_type in {"avg_pool", "max_pool"}:
+            pooled = _force_encoder.pool_force_history(obs.force_history, obs.force_history_mask, encoder_type)
+            return self.force_in_proj(pooled)
+        assert self.temporal_force_encoder is not None
+        return self.temporal_force_encoder(obs.force_history, obs.force_history_mask, train=train)
 
     @override
     def compute_loss(
@@ -273,7 +319,9 @@ class Pi0_Guidance(_model.BaseModel):
         u_t = noise - actions
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, force_tokens = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, force_tokens = self.embed_suffix(
+            observation, x_t, time, train=train
+        )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -335,7 +383,9 @@ class Pi0_Guidance(_model.BaseModel):
             )
             assert prefix_out is None
 
-            limoe_out = self.limoe(jnp.concatenate([prefix_out, force_tokens], axis=1)) ## prefix_out is vlm
+            # The cached suffix pass returns no prefix tensor; reuse the fixed
+            # prefix output computed before the denoising loop.
+            limoe_out = self.limoe(jnp.concatenate([prefix_out_fix, force_tokens], axis=1)) ## prefix_out is vlm
             v_t = self.action_out_proj(limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :])
             # v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 

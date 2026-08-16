@@ -137,11 +137,24 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    force_encoder = getattr(model_config, "force_encoder", None)
+    if (
+        force_encoder is not None
+        and force_encoder.type != "instantaneous"
+        and force_encoder.history_source == "aligned_state"
+    ):
+        history_samples = force_encoder.max_history_samples
+        # LeRobot resolves these against each observation timestamp. These are
+        # past/current samples only; no positive (future) observation offset.
+        delta_timestamps["observation.state"] = [
+            -(history_samples - 1 - i) / dataset_meta.fps for i in range(history_samples)
+        ]
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps,
     )
 
     if data_config.prompt_from_task:

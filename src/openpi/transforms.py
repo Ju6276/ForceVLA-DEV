@@ -102,6 +102,53 @@ class RepackTransform(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TimestampAlignedForceHistory(DataTransformFn):
+    """Extract a causal physical-time wrench window from an asynchronous stream.
+
+    The input sample must retain the complete (or sufficiently buffered) native-rate
+    wrench stream and its independent timestamps. Output is fixed-size and left
+    padded for batching; ``force_history_mask`` distinguishes padding from data.
+    """
+
+    force_key: str
+    force_timestamps_key: str
+    observation_timestamp_key: str
+    window_ms: float
+    max_samples: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        flat = flatten_dict(data)
+        force = np.asarray(flat[self.force_key], dtype=np.float32)
+        timestamps = np.asarray(flat[self.force_timestamps_key], dtype=np.float64)
+        target_time = float(np.asarray(flat[self.observation_timestamp_key]))
+        if force.ndim != 2 or force.shape[-1] != 6:
+            raise ValueError(f"Expected native force stream [N, 6], got {force.shape}")
+        if timestamps.ndim != 1 or timestamps.shape[0] != force.shape[0]:
+            raise ValueError("Force timestamps must be [N] and match the wrench stream")
+        if np.any(np.diff(timestamps) < 0):
+            raise ValueError("Force timestamps must be monotonically nondecreasing")
+
+        start_time = target_time - self.window_ms / 1000.0
+        # searchsorted(..., side='right') is important: samples after t_k can
+        # never enter the history, even when another modality has a later index.
+        begin = int(np.searchsorted(timestamps, start_time, side="left"))
+        end = int(np.searchsorted(timestamps, target_time, side="right"))
+        window = force[begin:end]
+        if window.shape[0] > self.max_samples:
+            window = window[-self.max_samples :]
+
+        history = np.zeros((self.max_samples, 6), dtype=np.float32)
+        mask = np.zeros((self.max_samples,), dtype=np.bool_)
+        if window.shape[0]:
+            history[-window.shape[0] :] = window
+            mask[-window.shape[0] :] = True
+        result = dict(data)
+        result["force_history"] = history
+        result["force_history_mask"] = mask
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
 class InjectDefaultPrompt(DataTransformFn):
     prompt: str | None
 

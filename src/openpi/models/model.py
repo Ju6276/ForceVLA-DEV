@@ -89,6 +89,11 @@ class Observation(Generic[ArrayT]):
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
 
+    # Optional native-rate force history, ordered oldest to newest. The mask is
+    # false for left padding introduced near the beginning of an episode.
+    force_history: at.Float[ArrayT, "*b n 6"] | None = None
+    force_history_mask: at.Bool[ArrayT, "*b n"] | None = None
+
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
@@ -115,6 +120,8 @@ class Observation(Generic[ArrayT]):
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            force_history=data.get("force_history"),
+            force_history_mask=data.get("force_history_mask"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -194,6 +201,8 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        force_history=observation.force_history,
+        force_history_mask=observation.force_history_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

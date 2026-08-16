@@ -64,3 +64,36 @@ export HF_LEROBOT_HOME="xxxxxx"
 python scripts/compute_norm_stats.py --config-name forcevla_lora 
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9  python scripts/train.py forcevla_lora --exp-name=my_experiment --overwrite  --batch_size 32 --save_interval 2000 --keep_period 10000
 ```
+
+### Temporal force front-end
+
+ForceVLA retains its checkpoint-compatible instantaneous front-end by default. The model's
+`force_encoder.type` can be set to `instantaneous`, `avg_pool`, `max_pool`, or `tcn`. For example:
+
+```python
+Pi0_GuidanceConfig(
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    force_encoder=ForceEncoderConfig(
+        type="tcn",
+        sampling_rate_hz=200,
+        window_ms=100,
+        hidden_dims=(1024, 1024, 1024, 1024),
+        dilations=(1, 2, 4, 8),
+        dropout_rate=0.1,
+        aggregation="last",  # or "mean"
+        history_source="timestamp_stream",  # or "aligned_state" for released 30 Hz ForceVLA data
+    ),
+)
+```
+
+Temporal modes expect each raw dataset item to retain `observation.force` as `[N, 6]`,
+`observation.force_timestamps` as `[N]`, and the VLA `timestamp` as a scalar (all timestamps in
+seconds). `LeRobotForcevlaDataConfig` exposes these key names. It extracts only samples in
+`[timestamp - window_ms, timestamp]`, keeps native-rate samples, and returns a left-padded history
+plus validity mask. FVLMoE, the Action Expert, action target, and training objective are unchanged.
+
+The released ForceVLA LeRobot data stores one wrench inside `observation.state` per 30 Hz frame.
+For a low-rate compatibility experiment, set `history_source="aligned_state"` and
+`sampling_rate_hz=30`; the loader requests causal negative frame offsets and never labels this as
+native-rate force.

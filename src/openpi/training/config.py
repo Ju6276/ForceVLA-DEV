@@ -20,8 +20,8 @@ import openpi.models.pi0_force as pi0_force
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
-import openpi.policies.libero_policy as libero_policy
 import openpi.policies.forcevla_policy as forcevla_policy
+import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -413,6 +413,9 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
     """
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
+    force_key: str = "observation.force"
+    force_timestamps_key: str = "observation.force_timestamps"
+    observation_timestamp_key: str = "timestamp"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -427,19 +430,35 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
         print("-"*100)
         print("ForceVla data is loading..")
         print("-"*100)
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "image": "observation.image",
-                        "wrist_image": "observation.wrist_image",
-                        "state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+        repack_mapping = {
+            "image": "observation.image",
+            "wrist_image": "observation.wrist_image",
+            "state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        use_force_history = isinstance(model_config, pi0_force.Pi0_GuidanceConfig) and (
+            model_config.force_encoder.type != "instantaneous"
         )
+        force_history_from_state = use_force_history and model_config.force_encoder.history_source == "aligned_state"
+        if use_force_history and not force_history_from_state:
+            repack_mapping.update(
+                force_history="force_history",
+                force_history_mask="force_history_mask",
+            )
+        repack_inputs = []
+        if use_force_history and not force_history_from_state:
+            repack_inputs.append(
+                _transforms.TimestampAlignedForceHistory(
+                    force_key=self.force_key,
+                    force_timestamps_key=self.force_timestamps_key,
+                    observation_timestamp_key=self.observation_timestamp_key,
+                    window_ms=model_config.force_encoder.window_ms,
+                    max_samples=model_config.force_encoder.max_history_samples,
+                )
+            )
+        repack_inputs.append(_transforms.RepackTransform(repack_mapping))
+        repack_transform = _transforms.Group(inputs=repack_inputs)
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
         # for data coming out of the model (``outputs``) (the latter is only used during inference).
@@ -447,7 +466,14 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
-            inputs=[forcevla_policy.Forcevla_inputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[
+                forcevla_policy.Forcevla_inputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    use_force_history=use_force_history,
+                    force_history_from_state=force_history_from_state,
+                )
+            ],
             outputs=[forcevla_policy.Forcevla_outputs()],
         )
         # One additional data transform: pi0 models are trained on delta actions (relative to the first
