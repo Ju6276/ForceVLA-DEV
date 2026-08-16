@@ -908,6 +908,7 @@ _CONFIGS = [
         ),
         data=LeRobotForcevlaDataConfig(
             repo_id="flexiv_insert_USB_inputForce",
+            assets=AssetsConfig(asset_id="flexiv_insert_USB_inputForce_instantaneous"),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
@@ -932,6 +933,7 @@ _CONFIGS = [
         ),
         data=LeRobotForcevlaDataConfig(
             repo_id="flexiv_insert_USB_inputForce",
+            assets=AssetsConfig(asset_id="flexiv_insert_USB_inputForce_temporal_30hz"),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),

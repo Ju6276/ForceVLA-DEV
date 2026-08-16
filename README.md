@@ -150,6 +150,9 @@ python scripts/train.py forcevla_usb_temporal_lora_aligned \
     --batch_size=4
 ```
 
+The two USB configs use separate normalization asset IDs, so computing temporal statistics cannot
+overwrite the instantaneous baseline statistics (or vice versa).
+
 For future native-rate datasets, the loader can keep LeRobot RGB/state/action rows at their original
 rate and join one timestamped NPZ force sidecar per episode. Each sidecar must use the same
 episode-relative clock as the LeRobot `timestamp` and contain `force: [M, 6]` plus
