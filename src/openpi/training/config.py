@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.models.force_encoder as force_encoder
 import openpi.models.model as _model
 import openpi.models.pi0 as pi0
 import openpi.models.pi0_fast as pi0_fast
@@ -63,6 +64,20 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class NativeForceSidecarConfig:
+    """Independent native-rate wrench stream stored once per episode as NPZ."""
+
+    data_dir: str
+    file_pattern: str = "episode_{episode_index:06d}.npz"
+    force_array_key: str = "force"
+    timestamp_array_key: str = "timestamps"
+    episode_index_key: str = "episode_index"
+    output_force_key: str = "observation.force"
+    output_timestamps_key: str = "observation.force_timestamps"
+    cache_size: int = 8
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
@@ -87,6 +102,10 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Optional per-episode native-rate force stream. The LeRobot table remains
+    # indexed at the RGB/action rate and this sidecar is joined by episode index.
+    native_force_sidecar: NativeForceSidecarConfig | None = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -416,6 +435,7 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
     force_key: str = "observation.force"
     force_timestamps_key: str = "observation.force_timestamps"
     observation_timestamp_key: str = "timestamp"
+    native_force_sidecar: NativeForceSidecarConfig | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -505,6 +525,7 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            native_force_sidecar=self.native_force_sidecar,
         )
 
 @dataclasses.dataclass(frozen=True)
@@ -845,6 +866,37 @@ _CONFIGS = [
         num_train_steps=50_000,
         freeze_filter=pi0_force.Pi0_GuidanceConfig(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
+    TrainConfig(
+        name="forcevla_temporal_lora_aligned",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=30,
+                window_ms=100,
+                history_source="aligned_state",
+            ),
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="flexiv_peel_cucumber_inputForce",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=30,
+                window_ms=100,
+                history_source="aligned_state",
+            ),
         ).get_freeze_filter(),
         ema_decay=None,
         batch_size=4,

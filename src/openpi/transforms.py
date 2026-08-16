@@ -115,6 +115,7 @@ class TimestampAlignedForceHistory(DataTransformFn):
     observation_timestamp_key: str
     window_ms: float
     max_samples: int
+    timestamp_tolerance_s: float = 1e-9
 
     def __call__(self, data: DataDict) -> DataDict:
         flat = flatten_dict(data)
@@ -127,14 +128,21 @@ class TimestampAlignedForceHistory(DataTransformFn):
             raise ValueError("Force timestamps must be [N] and match the wrench stream")
         if np.any(np.diff(timestamps) < 0):
             raise ValueError("Force timestamps must be monotonically nondecreasing")
+        if self.timestamp_tolerance_s < 0:
+            raise ValueError("Timestamp tolerance must be nonnegative")
 
         start_time = target_time - self.window_ms / 1000.0
         # Use the half-open interval (t_k - window, t_k]. Excluding the left
         # endpoint makes a 100 ms window contain exactly 20 regularly sampled
         # values at 200 Hz, while side="right" at the target keeps the current
         # sample and excludes every future sample.
-        begin = int(np.searchsorted(timestamps, start_time, side="right"))
-        end = int(np.searchsorted(timestamps, target_time, side="right"))
+        # A tiny tolerance absorbs float64 representations such as
+        # 1.0000000000000002 for a nominal 1.000 s sample. Dataset timestamps
+        # should be episode-relative seconds so this remains far below a sensor
+        # sampling interval and does not admit a genuinely future measurement.
+        boundary_tolerance = self.timestamp_tolerance_s
+        begin = int(np.searchsorted(timestamps, start_time + boundary_tolerance, side="left"))
+        end = int(np.searchsorted(timestamps, target_time + boundary_tolerance, side="right"))
         window = force[begin:end]
         if window.shape[0] > self.max_samples:
             window = window[-self.max_samples :]

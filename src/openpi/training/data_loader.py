@@ -12,6 +12,7 @@ import torch
 
 import openpi.models.model as _model
 import openpi.training.config as _config
+from openpi.training.async_force_dataset import NativeForceSidecarDataset
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
@@ -156,6 +157,20 @@ def create_torch_dataset(
         data_config.repo_id,
         delta_timestamps=delta_timestamps,
     )
+
+    if data_config.native_force_sidecar is not None:
+        sidecar = data_config.native_force_sidecar
+        dataset = NativeForceSidecarDataset(
+            dataset,
+            data_dir=sidecar.data_dir,
+            file_pattern=sidecar.file_pattern,
+            force_array_key=sidecar.force_array_key,
+            timestamp_array_key=sidecar.timestamp_array_key,
+            episode_index_key=sidecar.episode_index_key,
+            output_force_key=sidecar.output_force_key,
+            output_timestamps_key=sidecar.output_timestamps_key,
+            cache_size=sidecar.cache_size,
+        )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

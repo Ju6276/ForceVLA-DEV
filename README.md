@@ -2,6 +2,12 @@
 ## 
 ForceVLA is based on the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based diffusion vision-language-action model (VLA)； Both training and inference are based on π₀.
 
+> **Teacher branch scope.** This branch builds a unified Temporal ForceVLA teacher by replacing
+> only the instantaneous force front-end with a configurable causal temporal encoder. FVLMoE, the
+> Action Expert, action representation, and flow-matching objective remain unchanged. Teacher-student
+> distillation, force-masked teacher passes, nominal/residual students, and slow-fast execution are
+> intentionally not implemented at this stage.
+
 ## Requirements
 
 To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
@@ -97,3 +103,59 @@ The released ForceVLA LeRobot data stores one wrench inside `observation.state` 
 For a low-rate compatibility experiment, set `history_source="aligned_state"` and
 `sampling_rate_hz=30`; the loader requests causal negative frame offsets and never labels this as
 native-rate force.
+
+The named training configs make the mode explicit:
+
+```text
+forcevla_lora                    = original instantaneous 6D force
+forcevla_temporal_lora_aligned   = RGB-aligned force history through the causal TCN (30 Hz default)
+```
+
+To train the continuous 30 Hz history variant on the released ForceVLA-style data:
+
+```bash
+python scripts/compute_norm_stats.py --config-name forcevla_temporal_lora_aligned
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train.py \
+    forcevla_temporal_lora_aligned \
+    --exp-name=forcevla_temporal_30hz \
+    --overwrite \
+    --batch_size=4
+```
+
+Change the `repo_id` in `forcevla_temporal_lora_aligned` to select another ForceVLA-format task. Do
+not launch `forcevla_lora` when intending to use history: that named config deliberately preserves
+the original instantaneous baseline. The aligned config defaults to the released dataset's 30 Hz.
+For a dataset where RGB, state, and force are all 20 Hz, set `sampling_rate_hz=20`; the same 100 ms
+physical window then contains 2 force frames. The configured sampling rate must match the dataset
+FPS because the model input shape is static at initialization.
+
+For future native-rate datasets, the loader can keep LeRobot RGB/state/action rows at their original
+rate and join one timestamped NPZ force sidecar per episode. Each sidecar must use the same
+episode-relative clock as the LeRobot `timestamp` and contain `force: [M, 6]` plus
+`timestamps: [M]`, for example `force/episode_000000.npz`. Configure it with:
+
+```python
+LeRobotForcevlaDataConfig(
+    repo_id="your/lerobot_dataset",
+    native_force_sidecar=NativeForceSidecarConfig(data_dir="/data/force"),
+)
+```
+
+The corresponding model config must use the native timestamp stream:
+
+```python
+Pi0_GuidanceConfig(
+    paligemma_variant="gemma_2b_lora",
+    action_expert_variant="gemma_300m_lora",
+    force_encoder=ForceEncoderConfig(
+        type="tcn",
+        sampling_rate_hz=200,
+        window_ms=100,
+        history_source="timestamp_stream",
+    ),
+)
+```
+
+At 200 Hz with a 100 ms window, each 30 Hz VLA/RGB row retrieves the 20 wrench samples in
+`(timestamp - 100 ms, timestamp]`. The sidecar is cached per episode, future samples are excluded,
+and neighboring RGB rows may correctly use overlapping force windows.
