@@ -68,7 +68,9 @@ def _loss(model, batch, loss_config, *, train: bool):
 
 
 def _save_params(model, output_dir: pathlib.Path, step: int) -> None:
-    destination = output_dir / f"step-{step:05d}" / "params"
+    # TensorStore requires the checkpoint destination to be absolute even
+    # when the user supplied a repository-relative output directory.
+    destination = (output_dir / f"step-{step:05d}" / "params").resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     with ocp.PyTreeCheckpointer() as checkpointer:
         checkpointer.save(destination, {"params": nnx.state(model, nnx.Param)}, force=True)
