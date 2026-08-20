@@ -28,10 +28,10 @@ Stage 5  Intent Projector + Fast force residual student
 | Button 100 Hz-force Temporal Teacher（Stage 1） | 已训练 | step `39999` |
 | Button null-force adaptation（Stage 2） | 已训练 | step `9999` |
 | Button matched target extraction（Stage 3） | 已完成 | train 30,675 rows / 56 episodes；val 6,429 rows / 10 episodes |
-| Force-free Slow VLA（Stage 4） | 配置、真实数据、target、forward/gradient/resume 已验证；未正式训练 | 无 checkpoint |
-| Fast residual student（Stage 5） | 模型、loss、异步 runtime 和单元测试已实现；尚未接入正式训练入口 | 无 checkpoint |
+| Force-free Slow VLA（Stage 4） | 正式 10k 训练进行中，W&B online | step 5k / final 将保存 |
+| Fast residual student（Stage 5） | 正式 cache、训练、checkpoint、validation 入口和端到端 smoke 已验证；等待 Slow 完成 | 无正式 checkpoint |
 
-当前没有训练进程。checkpoint、W&B 本地目录和二进制 targets 均被 Git 忽略，不会随代码推送。
+checkpoint、W&B 本地目录和二进制 targets 均被 Git 忽略，不会随代码推送。
 
 已删除的旧方案包括：low-pass nominal target、固定力阈值/free-space loss、USB Stage 2A/2B、
 `avg_pool/max_pool` force encoder、相关旧评估脚本和 checkpoints。当前代码只保留 instantaneous、
@@ -153,7 +153,8 @@ ForceEncoderConfig(
 | `forcevla_button_temporal_100hz` | Button 100 Hz-force Temporal Teacher |
 | `forcevla_button_temporal_100hz_val` | Button held-out episode loader |
 | `forcevla_button_temporal_stage2_null_bc` | 当前选用的 Button Stage 2 |
-| `forcevla_button_slow_lora` | 已准备、尚未正式训练的 Stage 4 Slow VLA |
+| `forcevla_button_slow_lora` | Stage 4 Slow VLA train split |
+| `forcevla_button_slow_lora_val` | Stage 4 Slow VLA held-out split/cache extraction |
 
 这些 LoRA config 沿用 OpenPI/ForceVLA 的 freeze filter：Gemma 主权重冻结，LoRA 参数可训练；视觉编码器
 和部分 robotics projections 仍可训练。因此它是仓库的 low-memory LoRA recipe，不是严格意义上的
@@ -220,10 +221,7 @@ Slow 只读取 7D robot state（xyz、rpy、gripper），不读取 instantaneous
 训练 target 是 Stage 3 的 `normalized_null_actions`。它从 Stage 2 checkpoint 中加载结构兼容的 VLA/
 Action weights，但部署模型本身没有 ForceVLA force front-end、TCN 或 null token。
 
-当前已验证真实 dataset、target row 对齐、forward、gradient step 和 checkpoint resume；smoke checkpoint
-已经删除，尚未开始正式 10k 训练。
-
-若确认使用当前 `A_null` 作为第一版 nominal target，启动命令为：
+正式 10k 训练命令：
 
 ```bash
 unset WANDB_MODE
@@ -274,17 +272,41 @@ A_cmd[6]  = A_ref[6]       # gripper 由 Slow 负责
   single-step residual expert；
 - `src/openpi/training/slow_fast_distillation.py`：paired targets、Slow loss、residual + reconstruction loss；
 - `src/openpi/serving/slow_fast_runtime.py`：原子 Slow packet cache、按 timestamp 插值 `A_ref`、
-  phase/age 和 `A_ref + delta_A` composition。
+  phase/age 和 `A_ref + delta_A` composition；
+- `scripts/extract_slow_cache.py`：以 10 Hz 因果采样 Slow，缓存预测 chunk 与压缩后的 V-L context，
+  并为每个数据时间戳构造插值后的 `A_ref`；
+- `scripts/train_fast_residual.py`：正式 Fast optimizer、W&B、5k/final checkpoint 和 held-out validation。
 
-尚未完成：
+Slow 完成后，先提取 train/val cache：
 
-- 从正式训练后的 Slow VLA 导出并缓存 V-L hidden context；
-- 把 Slow prediction、intent、force/state/reference/time feature 接成正式 Fast dataset；
-- Fast `TrainConfig`、checkpoint 和 held-out evaluation；
-- 真实机器人上的异步 slow/fast control loop。
+```bash
+python scripts/extract_slow_cache.py \
+    --config-name=forcevla_button_slow_lora \
+    --stage3-dir=artifacts/button_stage3_paired_targets/train \
+    --checkpoint=checkpoints/forcevla_button_slow_lora/button_press_slow_null_distill/9999 \
+    --output=artifacts/button_slow_cache/train.npz
 
-因此 Slow 现在可以单独正式训练；Fast 架构已经固定，但还不能直接开始正式训练。正确顺序是先训练并冻结
-Slow，再完成 Fast 数据/训练入口。
+python scripts/extract_slow_cache.py \
+    --config-name=forcevla_button_slow_lora_val \
+    --stage3-dir=artifacts/button_stage3_paired_targets/val \
+    --checkpoint=checkpoints/forcevla_button_slow_lora/button_press_slow_null_distill/9999 \
+    --output=artifacts/button_slow_cache/val.npz
+```
+
+然后正式训练 Fast：
+
+```bash
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+python scripts/train_fast_residual.py \
+    --train-targets=artifacts/button_stage3_paired_targets/train \
+    --val-targets=artifacts/button_stage3_paired_targets/val \
+    --train-slow-cache=artifacts/button_slow_cache/train.npz \
+    --val-slow-cache=artifacts/button_slow_cache/val.npz \
+    --output-dir=checkpoints/button_press_fast_residual \
+    --steps=10000 --batch-size=64
+```
+
+仍未完成的是：真实机器人上的异步 slow/fast control loop。离线训练与 held-out evaluation 路径已经接通。
 
 ## 安装
 
@@ -331,12 +353,13 @@ python scripts/train.py forcevla_usb_temporal_lora_aligned \
 `forcevla_lora`/`forcevla_usb_lora` 始终是 instantaneous baseline；训练 history model 时必须显式选择
 temporal config。所有本分支 ForceVLA config 的 W&B project 均为 `forcevla`。
 
-## 下一步决策
+## 当前执行顺序
 
-继续训练前只需要决定一件事：是否接受当前 Stage 2 的 `A_null` 作为第一版 nominal target。
-
-- 若接受：正式训练 Stage 4 Slow 10k，先做 held-out validation，再完成 Fast 训练入口；
-- 若不接受：先修改 Stage 2 的 nominal 定义并重新提取 Stage 3 targets，不应直接训练 Slow。
+1. 完成 Stage 4 Slow 10k；
+2. 提取 train/held-out Slow packets，并报告 `A_ref` 对 `A_null` 的误差；
+3. 完成 Stage 5 Fast 10k；
+4. 比较 held-out residual MSE 与 zero-residual baseline，并检查 `A_ref + delta_A` 对 `A_full` 的重建误差；
+5. 离线结果通过后，再实现真实机器异步执行。
 
 当前仓库不宣称 Temporal 一定优于 Instantaneous，也不宣称 non-zero `A_full - A_null` 已经证明了
 有效 slow/fast 控制分解；最终结论必须来自 held-out 和在线机器人实验。

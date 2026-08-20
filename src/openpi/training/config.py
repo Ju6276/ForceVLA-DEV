@@ -1170,6 +1170,37 @@ _CONFIGS = [
         num_workers=2,
     ),
     TrainConfig(
+        name="forcevla_button_slow_lora_val",
+        project_name="forcevla",
+        # Evaluation/cache-extraction companion for the standalone force-free
+        # Slow student.  It deliberately shares the train normalization stats.
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="panda_button_press",
+            assets=AssetsConfig(
+                assets_dir="./assets/forcevla_button_temporal_100hz",
+                asset_id="panda_button_press_temporal_100hz_train56",
+            ),
+            robot_state_dims=7,
+            base_config=DataConfig(
+                episodes=_BUTTON_PRESS_VAL_EPISODES,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=0,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+        num_workers=0,
+    ),
+    TrainConfig(
         name="forcevla_button_temporal_stage2_null_bc",
         project_name="forcevla",
         model=pi0_force.Pi0_GuidanceConfig(
