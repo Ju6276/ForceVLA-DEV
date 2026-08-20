@@ -5,7 +5,7 @@
 Teacher-guided slow/fast distillation 准备 full/null targets、force-free Slow VLA 和轻量 Fast residual
 student。
 
-## 当前状态（2026-08-20）
+## 当前状态（2026-08-21）
 
 当前选用的 Button Press 路线只有这一条：
 
