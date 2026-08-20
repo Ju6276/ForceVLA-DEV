@@ -93,7 +93,6 @@ class Observation(Generic[ArrayT]):
     # false for left padding introduced near the beginning of an episode.
     force_history: at.Float[ArrayT, "*b n 6"] | None = None
     force_history_mask: at.Bool[ArrayT, "*b n"] | None = None
-
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.

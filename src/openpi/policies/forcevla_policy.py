@@ -1,5 +1,4 @@
 import dataclasses
-from typing import ClassVar
 
 import einops
 import numpy as np
@@ -12,8 +11,8 @@ def make_forcevla_example() -> dict:
     """Creates a random input example compatible with Flexiv config."""
     return {
         "state": np.ones((14,)),  # observation.state, 7 ee pose, 1 gripper, 6 force
-        "image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8), 
-        "wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8), 
+        "image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+        "wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
         "prompt": "do something",
     }
 
@@ -43,6 +42,10 @@ class Forcevla_inputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
     use_force_history: bool = False
     force_history_from_state: bool = False
+    # Restrict the state pathway to robot proprioception for a force-free
+    # student. For example, 7 keeps xyz, rpy, and gripper while replacing the
+    # wrench dimensions with padding that is independent of force.
+    robot_state_dims: int | None = None
 
     def __call__(self, data: dict) -> dict:
         # We only mask padding for pi0 model, not pi0-FAST. Do not change this for your own dataset.
@@ -55,7 +58,15 @@ class Forcevla_inputs(transforms.DataTransformFn):
         # in a different key than "observation/state", you should change it below.
         raw_state = np.asarray(data["state"])
         current_state = raw_state[-1] if self.force_history_from_state else raw_state
-        state = transforms.pad_to_dim(current_state, self.action_dim)
+        if self.robot_state_dims is not None:
+            if self.robot_state_dims <= 0 or self.robot_state_dims > current_state.shape[-1]:
+                raise ValueError(
+                    f"robot_state_dims must be in [1, {current_state.shape[-1]}], got {self.robot_state_dims}"
+                )
+            model_state = current_state[..., : self.robot_state_dims]
+        else:
+            model_state = current_state
+        state = transforms.pad_to_dim(model_state, self.action_dim)
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference.
@@ -119,7 +130,7 @@ class Forcevla_inputs(transforms.DataTransformFn):
             inputs["prompt"] = data["prompt"]
 
         return inputs
-    
+
 @dataclasses.dataclass(frozen=True)
 class Forcevla_outputs(transforms.DataTransformFn):
     """

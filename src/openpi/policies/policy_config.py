@@ -4,13 +4,15 @@ import logging
 import pathlib
 from typing import Any
 
-import jax.numpy as jnp
+from flax import nnx
+import jax
 
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
+from openpi.training import weight_loaders
 import openpi.transforms as transforms
 
 
@@ -53,7 +55,15 @@ def create_trained_policy(
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     logging.info("Loading model...")
-    model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+    # Canonicalize checkpoint paths against the NNX reference tree. Orbax can
+    # restore list indices (such as temporal TCN blocks) as string dictionary
+    # keys, while NNX uses integer keys.
+    model_shape = nnx.eval_shape(train_config.model.create, jax.random.key(0))
+    reference_state = nnx.state(model_shape).to_pure_dict()
+    params = weight_loaders.CheckpointWeightLoader(
+        str(checkpoint_dir / "params"), missing_regex=r"a^"
+    ).load(reference_state)
+    model = train_config.model.load(params, remove_extra_params=False)
 
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
@@ -62,6 +72,11 @@ def create_trained_policy(
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+
+    # Output dictionaries contain only state and actions. Temporal ForceVLA
+    # normalization additionally contains the input-only force_history key,
+    # which must not be required during strict output unnormalization.
+    output_norm_stats = {key: value for key, value in norm_stats.items() if key in {"state", "actions"}}
 
     return _policy.Policy(
         model,
@@ -74,7 +89,7 @@ def create_trained_policy(
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Unnormalize(output_norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],

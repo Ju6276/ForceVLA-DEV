@@ -115,6 +115,8 @@ class TimestampAlignedForceHistory(DataTransformFn):
     observation_timestamp_key: str
     window_ms: float
     max_samples: int
+    sampling_rate_hz: float | None = None
+    max_sample_age_ms: float | None = None
     timestamp_tolerance_s: float = 1e-9
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -130,6 +132,42 @@ class TimestampAlignedForceHistory(DataTransformFn):
             raise ValueError("Force timestamps must be monotonically nondecreasing")
         if self.timestamp_tolerance_s < 0:
             raise ValueError("Timestamp tolerance must be nonnegative")
+        if self.sampling_rate_hz is not None:
+            if self.sampling_rate_hz <= 0:
+                raise ValueError("sampling_rate_hz must be positive")
+            if self.max_sample_age_ms is not None and self.max_sample_age_ms <= 0:
+                raise ValueError("max_sample_age_ms must be positive")
+            expected_samples = self.sampling_rate_hz * self.window_ms / 1000.0
+            if not np.isclose(expected_samples, self.max_samples):
+                raise ValueError(
+                    "Fixed-rate force history requires sampling_rate_hz * window_ms / 1000 == max_samples"
+                )
+
+            # Ten 100 Hz slots over (t-100 ms, t] are t-90 ms, ..., t.
+            offsets = np.arange(self.max_samples - 1, -1, -1, dtype=np.float64) / self.sampling_rate_hz
+            grid_times = target_time - offsets
+            source_indices = np.searchsorted(timestamps, grid_times + self.timestamp_tolerance_s, side="right") - 1
+            safe_indices = np.maximum(source_indices, 0)
+            source_times = timestamps[safe_indices]
+            ages = grid_times - source_times
+            max_age_s = (
+                self.max_sample_age_ms / 1000.0
+                if self.max_sample_age_ms is not None
+                else 1.5 / self.sampling_rate_hz
+            )
+            valid = (
+                (source_indices >= 0)
+                & (source_times > target_time - self.window_ms / 1000.0)
+                & (source_times <= grid_times + self.timestamp_tolerance_s)
+                & (ages >= -self.timestamp_tolerance_s)
+                & (ages <= max_age_s + self.timestamp_tolerance_s)
+            )
+            history = force[safe_indices].copy()
+            history[~valid] = 0.0
+            result = dict(data)
+            result["force_history"] = history
+            result["force_history_mask"] = valid.astype(np.bool_)
+            return result
 
         start_time = target_time - self.window_ms / 1000.0
         # Use the half-open interval (t_k - window, t_k]. Excluding the left

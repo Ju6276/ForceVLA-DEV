@@ -274,17 +274,60 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, _, kv_cache = self._prepare_action_prefix(observation)
+        return self._sample_actions_with_prefix(
+            rng,
+            observation,
+            num_steps=num_steps,
+            prefix_tokens=prefix_tokens,
+            prefix_mask=prefix_mask,
+            kv_cache=kv_cache,
+        )
+
+    def sample_actions_and_context(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+    ):
+        """Sample a force-free nominal chunk and expose its vision-language context."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_context, kv_cache = self._prepare_action_prefix(observation)
+        actions = self._sample_actions_with_prefix(
+            rng,
+            observation,
+            num_steps=num_steps,
+            prefix_tokens=prefix_tokens,
+            prefix_mask=prefix_mask,
+            kv_cache=kv_cache,
+        )
+        return actions, prefix_context, prefix_mask
+
+    def _prepare_action_prefix(self, observation: _model.Observation):
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_context, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return prefix_tokens, prefix_mask, prefix_context, kv_cache
+
+    def _sample_actions_with_prefix(
+        self,
+        rng,
+        observation,
+        *,
+        num_steps,
+        prefix_tokens,
+        prefix_mask,
+        kv_cache,
+    ):
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
-
-        # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry

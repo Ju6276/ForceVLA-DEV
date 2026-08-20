@@ -81,14 +81,25 @@ class Pi0_GuidanceConfig(_model.BaseModelConfig):
     force_encoder: _force_encoder.ForceEncoderConfig = dataclasses.field(
         default_factory=_force_encoder.ForceEncoderConfig
     )
-    # Stage 1 keeps this disabled and uses the full force token. Stage 2A
-    # enables it and trains only the learned missing-force representation.
+    # Stage 1 keeps this disabled and uses the full force token. Stage 2
+    # enables it for the learned missing-force condition.
     enable_null_force_token: bool = False
     force_condition: typing.Literal["full", "null"] = "full"
+    # The selected Stage 2 adds a small null-only low-rank adapter to the action
+    # vector field. The full-force path bypasses it, preserving Stage 1.
+    enable_nominal_adapter: bool = False
+    nominal_adapter_rank: int = 32
+    nominal_adapter_pose_dims: int = 6
 
     def __post_init__(self):
         if self.force_condition == "null" and not self.enable_null_force_token:
             raise ValueError("force_condition='null' requires enable_null_force_token=True")
+        if self.enable_nominal_adapter and not self.enable_null_force_token:
+            raise ValueError("enable_nominal_adapter=True requires enable_null_force_token=True")
+        if self.nominal_adapter_rank <= 0:
+            raise ValueError("nominal_adapter_rank must be positive")
+        if not 0 < self.nominal_adapter_pose_dims <= self.action_dim:
+            raise ValueError("nominal_adapter_pose_dims must be in [1, action_dim]")
 
     @property
     @override
@@ -197,7 +208,7 @@ class Pi0_Guidance(_model.BaseModel):
         self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         # self.action_state_attention = nnx.MultiHeadAttention(
-        #     in_features=action_expert_config.width, 
+        #     in_features=action_expert_config.width,
         #     num_heads=8,
         #     rngs=rngs
         # )
@@ -214,6 +225,23 @@ class Pi0_Guidance(_model.BaseModel):
             if config.enable_null_force_token
             else None
         )
+        self.nominal_adapter_in = (
+            nnx.Linear(action_expert_config.width, config.nominal_adapter_rank, use_bias=False, rngs=rngs)
+            if config.enable_nominal_adapter
+            else None
+        )
+        self.nominal_adapter_out = (
+            nnx.Linear(
+                config.nominal_adapter_rank,
+                config.nominal_adapter_pose_dims,
+                use_bias=False,
+                kernel_init=nnx.initializers.zeros_init(),
+                rngs=rngs,
+            )
+            if config.enable_nominal_adapter
+            else None
+        )
+        self.nominal_adapter_pose_dims = config.nominal_adapter_pose_dims
         self.force_condition = config.force_condition
         print("paligemma_config.width: ", paligemma_config.width)
         self.limoe = nnx_bridge.ToNNX(
@@ -269,6 +297,7 @@ class Pi0_Guidance(_model.BaseModel):
         timestep: at.Float[at.Array, " b"],
         *,
         train: bool = False,
+        force_condition: typing.Literal["full", "null"] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s action_emb"],
         at.Bool[at.Array, "b s"],
@@ -303,12 +332,19 @@ class Pi0_Guidance(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        force_tokens = self.encode_force(obs, train=train)[:, None, :]
+        force_tokens = self.encode_force(obs, train=train, force_condition=force_condition)[:, None, :]
         return tokens, input_mask, ar_mask, force_tokens
 
-    def encode_force(self, obs: _model.Observation, *, train: bool = False):
+    def encode_force(
+        self,
+        obs: _model.Observation,
+        *,
+        train: bool = False,
+        force_condition: typing.Literal["full", "null"] | None = None,
+    ):
         """Return the single force token consumed by the unchanged LIMoE interface."""
-        if self.force_condition == "null":
+        condition = self.force_condition if force_condition is None else force_condition
+        if condition == "null":
             if self.null_force_token is None:
                 raise ValueError("The null force condition requires a learned null_force_token")
             return jnp.broadcast_to(self.null_force_token.value, (obs.state.shape[0], self.null_force_token.shape[0]))
@@ -319,16 +355,61 @@ class Pi0_Guidance(_model.BaseModel):
             return self.force_in_proj(obs.state[:, 7:13])
         if obs.force_history is None or obs.force_history_mask is None:
             raise ValueError(f"force_history and force_history_mask are required for {encoder_type!r} mode")
-        if encoder_type in {"avg_pool", "max_pool"}:
-            pooled = _force_encoder.pool_force_history(obs.force_history, obs.force_history_mask, encoder_type)
-            return self.force_in_proj(pooled)
         assert self.temporal_force_encoder is not None
         return self.temporal_force_encoder(obs.force_history, obs.force_history_mask, train=train)
+
+    def _project_action_velocity(
+        self,
+        hidden: at.Float[at.Array, "b ah action_emb"],
+        force_condition: typing.Literal["full", "null"],
+    ) -> _model.Actions:
+        velocity = self.action_out_proj(hidden)
+        if force_condition == "null" and self.nominal_adapter_in is not None:
+            assert self.nominal_adapter_out is not None
+            pose_correction = self.nominal_adapter_out(nnx.silu(self.nominal_adapter_in(hidden)))
+            velocity = velocity.at[..., : self.nominal_adapter_pose_dims].add(pose_correction)
+        return velocity
 
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        return self.compute_loss_for_force_condition(
+            rng,
+            observation,
+            actions,
+            force_condition=self.force_condition,
+            train=train,
+        )
+
+    def compute_loss_for_force_condition(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        force_condition: typing.Literal["full", "null"],
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah"]:
+        v_t, u_t = self.compute_flow_velocity_for_force_condition(
+            rng,
+            observation,
+            actions,
+            force_condition=force_condition,
+            train=train,
+        )
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+    def compute_flow_velocity_for_force_condition(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        force_condition: typing.Literal["full", "null"],
+        train: bool = False,
+    ) -> tuple[_model.Actions, _model.Actions]:
+        """Return predicted and target flow velocities for one force condition."""
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         batch_shape = actions.shape[:-2]
@@ -340,20 +421,21 @@ class Pi0_Guidance(_model.BaseModel):
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, force_tokens = self.embed_suffix(
-            observation, x_t, time, train=train
+            observation, x_t, time, train=train, force_condition=force_condition
         )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-       
+
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
         )
-        
+
         limoe_out = self.limoe(jnp.concatenate([prefix_out, force_tokens], axis=1)) ## prefix_out is vlm
-        v_t = self.action_out_proj(limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :])
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        hidden = limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :]
+        v_t = self._project_action_velocity(hidden, force_condition)
+        return v_t, u_t
 
     @override
     def sample_actions(
@@ -363,23 +445,125 @@ class Pi0_Guidance(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
     ) -> _model.Actions:
+        return self.sample_actions_for_force_condition(
+            rng,
+            observation,
+            force_condition=self.force_condition,
+            num_steps=num_steps,
+        )
+
+    def sample_actions_for_force_condition(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        force_condition: typing.Literal["full", "null"],
+        num_steps: int | at.Int[at.Array, ""] = 10,
+    ) -> _model.Actions:
+        """Sample one explicit force condition for paired Teacher distillation."""
+        if force_condition == "null" and self.null_force_token is None:
+            raise ValueError("Null-force sampling requires a learned null_force_token")
         observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_out_fix, kv_cache = self._prepare_action_prefix(observation)
+        return self._sample_actions_with_prefix(
+            rng,
+            observation,
+            force_condition=force_condition,
+            num_steps=num_steps,
+            prefix_tokens=prefix_tokens,
+            prefix_mask=prefix_mask,
+            prefix_out_fix=prefix_out_fix,
+            kv_cache=kv_cache,
+        )
+
+    def sample_nominal_actions_and_context(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+    ):
+        """Run the null path once and expose its contextualized prefix for intent projection."""
+        if self.null_force_token is None:
+            raise ValueError("Nominal context sampling requires a learned null_force_token")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_out_fix, kv_cache = self._prepare_action_prefix(observation)
+        actions = self._sample_actions_with_prefix(
+            rng,
+            observation,
+            force_condition="null",
+            num_steps=num_steps,
+            prefix_tokens=prefix_tokens,
+            prefix_mask=prefix_mask,
+            prefix_out_fix=prefix_out_fix,
+            kv_cache=kv_cache,
+        )
+        return actions, prefix_out_fix, prefix_mask
+
+    def sample_paired_actions_and_context(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+    ):
+        """Efficiently generate matched full/null actions and one shared Slow context."""
+        if self.null_force_token is None:
+            raise ValueError("Paired sampling requires a learned null_force_token")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_out_fix, kv_cache = self._prepare_action_prefix(observation)
+        kwargs = {
+            "num_steps": num_steps,
+            "prefix_tokens": prefix_tokens,
+            "prefix_mask": prefix_mask,
+            "prefix_out_fix": prefix_out_fix,
+            "kv_cache": kv_cache,
+        }
+        # The identical RNG gives both flow samplers exactly the same initial
+        # noise; force condition is the only difference between their outputs.
+        full = self._sample_actions_with_prefix(
+            rng, observation, force_condition="full", **kwargs
+        )
+        null = self._sample_actions_with_prefix(
+            rng, observation, force_condition="null", **kwargs
+        )
+        return full, null, prefix_out_fix, prefix_mask
+
+    def _prepare_action_prefix(self, observation: _model.Observation):
+        """Encode vision/language once for both action sampling and cached intent."""
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out_fix, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return prefix_tokens, prefix_mask, prefix_out_fix, kv_cache
+
+    def _sample_actions_with_prefix(
+        self,
+        rng,
+        observation,
+        *,
+        force_condition,
+        num_steps,
+        prefix_tokens,
+        prefix_mask,
+        prefix_out_fix,
+        kv_cache,
+    ):
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out_fix, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
-
         def step(carry):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, force_tokens = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+                force_condition=force_condition,
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -406,7 +590,8 @@ class Pi0_Guidance(_model.BaseModel):
             # The cached suffix pass returns no prefix tensor; reuse the fixed
             # prefix output computed before the denoising loop.
             limoe_out = self.limoe(jnp.concatenate([prefix_out_fix, force_tokens], axis=1)) ## prefix_out is vlm
-            v_t = self.action_out_proj(limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :])
+            hidden = limoe_out[0][:, -self.action_horizon :] + suffix_out[:, -self.action_horizon :]
+            v_t = self._project_action_velocity(hidden, force_condition)
             # v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt

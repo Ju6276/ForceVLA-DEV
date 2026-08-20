@@ -1,7 +1,7 @@
 """Dataset adapter for native-rate timestamped force sidecars."""
 
+from collections import OrderedDict
 from collections.abc import Mapping
-import functools
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,8 @@ class NativeForceSidecarDataset:
         self._episode_index_key = episode_index_key
         self._output_force_key = output_force_key
         self._output_timestamps_key = output_timestamps_key
-        self._load_episode = functools.lru_cache(maxsize=cache_size)(self._load_episode_uncached)
+        self._cache_size = cache_size
+        self._episode_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray]] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -54,6 +55,16 @@ class NativeForceSidecarDataset:
         item[self._output_force_key] = force
         item[self._output_timestamps_key] = timestamps
         return item
+
+    def _load_episode(self, episode_index: int) -> tuple[np.ndarray, np.ndarray]:
+        if episode_index in self._episode_cache:
+            self._episode_cache.move_to_end(episode_index)
+            return self._episode_cache[episode_index]
+        value = self._load_episode_uncached(episode_index)
+        self._episode_cache[episode_index] = value
+        if len(self._episode_cache) > self._cache_size:
+            self._episode_cache.popitem(last=False)
+        return value
 
     def _load_episode_uncached(self, episode_index: int) -> tuple[np.ndarray, np.ndarray]:
         path = self._data_dir / self._file_pattern.format(episode_index=episode_index)

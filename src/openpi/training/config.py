@@ -36,6 +36,66 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
+_BUTTON_PRESS_TRAIN_EPISODES = (
+    0,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    21,
+    24,
+    43,
+    44,
+    45,
+    46,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    69,
+    70,
+    72,
+    74,
+    75,
+    77,
+    78,
+    79,
+    80,
+    82,
+    83,
+    85,
+    87,
+    89,
+    90,
+)
+_BUTTON_PRESS_VAL_EPISODES = (1, 2, 20, 42, 47, 68, 71, 73, 76, 84)
+
 
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
@@ -82,6 +142,9 @@ class NativeForceSidecarConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional complete-episode subset. This enables leakage-free train/validation
+    # splits without copying or renumbering a local LeRobot dataset.
+    episodes: tuple[int, ...] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -423,7 +486,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
             action_space=self.action_space,
             filter_dict_path=self.filter_dict_path,
         )
-    
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotForcevlaDataConfig(DataConfigFactory):
     """
@@ -437,6 +500,9 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
     force_timestamps_key: str = "observation.force_timestamps"
     observation_timestamp_key: str = "timestamp"
     native_force_sidecar: NativeForceSidecarConfig | None = None
+    # If set, expose only the first N robot-state dimensions to the model and
+    # replace the rest with force-independent padding. Stage-4 Slow uses 7.
+    robot_state_dims: int | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -476,6 +542,8 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
                     observation_timestamp_key=self.observation_timestamp_key,
                     window_ms=model_config.force_encoder.window_ms,
                     max_samples=model_config.force_encoder.max_history_samples,
+                    sampling_rate_hz=model_config.force_encoder.sampling_rate_hz,
+                    max_sample_age_ms=model_config.force_encoder.max_sample_age_ms,
                 )
             )
         repack_inputs.append(_transforms.RepackTransform(repack_mapping))
@@ -493,6 +561,7 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
                     model_type=model_config.model_type,
                     use_force_history=use_force_history,
                     force_history_from_state=force_history_from_state,
+                    robot_state_dims=self.robot_state_dims,
                 )
             ],
             outputs=[forcevla_policy.Forcevla_outputs()],
@@ -589,6 +658,11 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+
+    # Optional Stage-3 target extraction directory. When set, the transformed
+    # dataset's action is replaced by this aligned offline Teacher target.
+    offline_action_target_dir: str | None = None
+    offline_action_target_key: str = "normalized_null_actions"
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -861,6 +935,7 @@ _CONFIGS = [
 
     TrainConfig(
         name="forcevla_lora",
+        project_name="forcevla",
         model=pi0_force.Pi0_GuidanceConfig(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotForcevlaDataConfig(
             repo_id="flexiv_peel_cucumber_inputForce",
@@ -877,6 +952,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="forcevla_temporal_lora_aligned",
+        project_name="forcevla",
         model=pi0_force.Pi0_GuidanceConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
@@ -908,16 +984,21 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="forcevla_usb_lora",
-        model=pi0_force.Pi0_GuidanceConfig(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ),
+        project_name="forcevla",
+        model=pi0_force.Pi0_GuidanceConfig(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotForcevlaDataConfig(
             repo_id="flexiv_insert_USB_inputForce",
             assets=AssetsConfig(asset_id="flexiv_insert_USB_inputForce_instantaneous"),
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=50_000,
+        # Match the completed temporal Teacher checkpoint for a controlled
+        # instantaneous-vs-history comparison on the same 40k-step budget.
+        num_train_steps=40_000,
+        # Keep one recovery point and the final checkpoint without retaining a
+        # 9-10 GB checkpoint every 5k steps.
+        save_interval=20_000,
+        keep_period=20_000,
         freeze_filter=pi0_force.Pi0_GuidanceConfig(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
@@ -926,6 +1007,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="forcevla_usb_temporal_lora_aligned",
+        project_name="forcevla",
         model=pi0_force.Pi0_GuidanceConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
@@ -957,34 +1039,175 @@ _CONFIGS = [
         batch_size=4,
     ),
     TrainConfig(
-        name="forcevla_usb_temporal_stage2a_null",
+        name="forcevla_button_temporal_100hz",
+        project_name="forcevla",
         model=pi0_force.Pi0_GuidanceConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             force_encoder=force_encoder.ForceEncoderConfig(
                 type="tcn",
-                sampling_rate_hz=30,
+                sampling_rate_hz=100,
                 window_ms=100,
-                history_source="aligned_state",
+                max_sample_age_ms=12,
+                history_source="timestamp_stream",
+            ),
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="panda_button_press",
+            assets=AssetsConfig(asset_id="panda_button_press_temporal_100hz_train56"),
+            native_force_sidecar=NativeForceSidecarConfig(
+                data_dir="./data/panda_button_press_100hz_causal/raw_sidecars"
+            ),
+            base_config=DataConfig(
+                episodes=_BUTTON_PRESS_TRAIN_EPISODES,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        save_interval=20_000,
+        keep_period=20_000,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=100,
+                window_ms=100,
+                max_sample_age_ms=12,
+                history_source="timestamp_stream",
+            ),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
+    TrainConfig(
+        name="forcevla_button_temporal_100hz_val",
+        project_name="forcevla",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=100,
+                window_ms=100,
+                max_sample_age_ms=12,
+                history_source="timestamp_stream",
+            ),
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="panda_button_press",
+            assets=AssetsConfig(
+                assets_dir="./assets/forcevla_button_temporal_100hz",
+                asset_id="panda_button_press_temporal_100hz_train56",
+            ),
+            native_force_sidecar=NativeForceSidecarConfig(
+                data_dir="./data/panda_button_press_100hz_causal/raw_sidecars"
+            ),
+            base_config=DataConfig(
+                episodes=_BUTTON_PRESS_VAL_EPISODES,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=0,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=100,
+                window_ms=100,
+                max_sample_age_ms=12,
+                history_source="timestamp_stream",
+            ),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
+    TrainConfig(
+        name="forcevla_button_slow_lora",
+        project_name="forcevla",
+        # Stage 4 is intentionally a standard force-free pi0. It inherits all
+        # compatible Stage-2 weights, then distills the Teacher's null actions.
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="panda_button_press",
+            assets=AssetsConfig(
+                assets_dir="./assets/forcevla_button_temporal_100hz",
+                asset_id="panda_button_press_temporal_100hz_train56",
+            ),
+            robot_state_dims=7,
+            base_config=DataConfig(
+                episodes=_BUTTON_PRESS_TRAIN_EPISODES,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_null_bc/9999/params",
+            missing_regex=r"a^",
+        ),
+        offline_action_target_dir="./artifacts/button_stage3_paired_targets/train",
+        offline_action_target_key="normalized_null_actions",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=10_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+        num_workers=2,
+    ),
+    TrainConfig(
+        name="forcevla_button_temporal_stage2_null_bc",
+        project_name="forcevla",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(
+                type="tcn",
+                sampling_rate_hz=100,
+                window_ms=100,
+                max_sample_age_ms=12,
+                history_source="timestamp_stream",
             ),
             enable_null_force_token=True,
             force_condition="null",
+            enable_nominal_adapter=True,
+            nominal_adapter_rank=32,
+            nominal_adapter_pose_dims=6,
         ),
         data=LeRobotForcevlaDataConfig(
-            repo_id="flexiv_insert_USB_inputForce",
-            # Stage 2A uses the identical data representation as the Stage 1
-            # temporal Teacher, so it must reuse the same normalization stats.
+            repo_id="panda_button_press",
             assets=AssetsConfig(
-                assets_dir="./assets/forcevla_usb_temporal_lora_aligned",
-                asset_id="flexiv_insert_USB_inputForce_temporal_30hz",
+                assets_dir="./assets/forcevla_button_temporal_100hz",
+                asset_id="panda_button_press_temporal_100hz_train56",
             ),
-            base_config=DataConfig(prompt_from_task=True),
+            native_force_sidecar=NativeForceSidecarConfig(
+                data_dir="./data/panda_button_press_100hz_causal/raw_sidecars"
+            ),
+            base_config=DataConfig(
+                episodes=_BUTTON_PRESS_TRAIN_EPISODES,
+                prompt_from_task=True,
+            ),
         ),
-        # This path matches the Stage 1 command documented in README.md. Override
-        # --weight-loader.params-path when selecting a different Stage 1 checkpoint.
+        # Stage 2 null-BC is a missing-force adaptation of the frozen temporal
+        # Teacher.  It deliberately uses the original expert actions: no
+        # low-pass nominal target, force threshold, or free-space mask.
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/forcevla_usb_temporal_lora_aligned/forcevla_usb_temporal/49999/params",
-            missing_regex=".*null_force_token.*",
+            "./checkpoints/forcevla_button_temporal_100hz/button_press_temporal_100hz/39999/params",
+            missing_regex=".*null_force_token.*|.*nominal_adapter_(in|out).*",
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=500,
@@ -993,20 +1216,21 @@ _CONFIGS = [
             decay_lr=2.5e-6,
         ),
         num_train_steps=10_000,
-        # Freeze every parameter except the newly introduced null force token.
-        # Restrict the filter to Params so non-parameter state such as Dropout
-        # PRNG keys is not cast to bfloat16 during train-state initialization.
-        freeze_filter=nnx.All(nnx.Param, nnx.Not(nnx_utils.PathRegex(".*null_force_token.*"))),
-        # Preserve the Stage 1 mixed-precision layout instead of casting newly
-        # frozen LoRA/TCN/fusion parameters to bfloat16.
+        save_interval=10_000,
+        keep_period=10_000,
+        freeze_filter=nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*(null_force_token|nominal_adapter_(in|out)).*")),
+        ),
         bfloat16_cast_filter=pi0_force.Pi0_GuidanceConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             force_encoder=force_encoder.ForceEncoderConfig(
                 type="tcn",
-                sampling_rate_hz=30,
+                sampling_rate_hz=100,
                 window_ms=100,
-                history_source="aligned_state",
+                max_sample_age_ms=12,
+                history_source="timestamp_stream",
             ),
         ).get_freeze_filter(),
         ema_decay=None,

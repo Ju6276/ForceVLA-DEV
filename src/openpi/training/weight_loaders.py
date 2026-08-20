@@ -119,7 +119,14 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
         ref_key = ref_paths.get(tuple(map(str, k)))
         if ref_key is not None:
             ref_value = flat_ref[ref_key]
-            if jax.dtypes.issubdtype(ref_value.dtype, jax.dtypes.prng_key):
+            # Bias-free NNX Linear layers keep an explicit ``None`` leaf.
+            # Orbax preserves that leaf, so pass it through without attempting
+            # dtype inspection/casting.
+            if ref_value is None:
+                if v is not None:
+                    raise ValueError(f"Expected None checkpoint leaf at {ref_key}, got {type(v).__name__}")
+                result[ref_key] = None
+            elif jax.dtypes.issubdtype(ref_value.dtype, jax.dtypes.prng_key):
                 # PRNG state is not a learned teacher weight, and legacy
                 # checkpoints may store it using an incompatible uint32 form.
                 result[ref_key] = ref_value

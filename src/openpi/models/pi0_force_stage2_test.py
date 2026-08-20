@@ -28,49 +28,24 @@ def test_null_force_token_is_broadcast_across_batch():
     np.testing.assert_array_equal(encoded, np.tile(np.arange(4, dtype=np.float32), (3, 1)))
 
 
-def test_stage2a_filter_trains_only_null_force_token():
-    class ToyModel(nnx.Module):
-        def __init__(self):
-            self.null_force_token = nnx.Param(jnp.zeros(4))
-            self.existing_teacher_weight = nnx.Param(jnp.ones(4))
-            self.dropout = nnx.Dropout(0.1, rngs=nnx.Rngs(0))
-
-    state = nnx.state(ToyModel())
-    config = training_config.get_config("forcevla_usb_temporal_stage2a_null")
-    trainable_state = state.filter(config.trainable_filter)
-    frozen_state = state.filter(config.freeze_filter)
-
-    assert set(trainable_state) == {"null_force_token"}
-    assert set(frozen_state) == {"existing_teacher_weight"}
-
-
-def test_stage2a_schedule_matches_training_horizon():
-    config = training_config.get_config("forcevla_usb_temporal_stage2a_null")
-
-    assert config.num_train_steps == 10_000
-    assert config.lr_schedule.warmup_steps == 500
-    assert config.lr_schedule.peak_lr == 2.5e-5
-    assert config.lr_schedule.decay_steps == config.num_train_steps
-    assert config.lr_schedule.decay_lr == 2.5e-6
-
-
-def test_stage1_checkpoint_can_initialize_new_null_token():
+def test_stage1_checkpoint_can_initialize_selected_stage2_parameters():
     loaded = {
         "teacher": {"weight": np.ones((2,), dtype=np.float32)},
-        # Orbax restores list indices as strings, while the initialized NNX
-        # parameter tree uses integer keys.
+        # Orbax restores list indices as strings, while NNX uses integers.
         "temporal_force_encoder": {"blocks": {"0": {"kernel": np.ones((2,), dtype=np.float32)}}},
     }
     initialized = {
         "teacher": {"weight": np.zeros((2,), dtype=np.float32)},
         "temporal_force_encoder": {"blocks": {0: {"kernel": np.zeros((2,), dtype=np.float32)}}},
         "null_force_token": np.zeros((4,), dtype=np.float32),
+        "nominal_adapter_in": {"kernel": np.zeros((2, 2), dtype=np.float32)},
+        "nominal_adapter_out": {"kernel": np.zeros((2, 2), dtype=np.float32)},
     }
 
-    merged = weight_loaders._merge_params(
+    merged = weight_loaders._merge_params(  # noqa: SLF001
         loaded,
         initialized,
-        missing_regex=".*null_force_token.*|.*temporal_force_encoder.*",
+        missing_regex=".*null_force_token.*|.*nominal_adapter_(in|out).*|.*temporal_force_encoder.*",
     )
 
     np.testing.assert_array_equal(merged["teacher"]["weight"], loaded["teacher"]["weight"])
@@ -79,3 +54,50 @@ def test_stage1_checkpoint_can_initialize_new_null_token():
         merged["temporal_force_encoder"]["blocks"][0]["kernel"],
         loaded["temporal_force_encoder"]["blocks"]["0"]["kernel"],
     )
+
+
+def test_checkpoint_merge_preserves_bias_free_none_leaf():
+    loaded = {"adapter": {"kernel": np.ones((2, 2), dtype=np.float32), "bias": None}}
+    initialized = {"adapter": {"kernel": np.zeros((2, 2), dtype=np.float32), "bias": None}}
+
+    merged = weight_loaders._merge_params(loaded, initialized, missing_regex=r"a^")  # noqa: SLF001
+
+    assert merged["adapter"]["bias"] is None
+    np.testing.assert_array_equal(merged["adapter"]["kernel"], loaded["adapter"]["kernel"])
+
+
+def test_selected_button_stage2_uses_original_bc_and_only_trains_null_parameters():
+    class ToyModel(nnx.Module):
+        def __init__(self):
+            self.null_force_token = nnx.Param(jnp.zeros(4))
+            self.nominal_adapter_in = nnx.Linear(4, 2, rngs=nnx.Rngs(0))
+            self.nominal_adapter_out = nnx.Linear(2, 4, rngs=nnx.Rngs(1))
+            self.existing_teacher_weight = nnx.Param(jnp.ones(4))
+
+    config = training_config.get_config("forcevla_button_temporal_stage2_null_bc")
+    trainable_state = nnx.state(ToyModel()).filter(config.trainable_filter)
+
+    assert config.model.force_condition == "null"
+    assert config.model.enable_null_force_token
+    assert config.model.enable_nominal_adapter
+    assert config.model.nominal_adapter_rank == 32
+    assert config.lr_schedule.warmup_steps == 500
+    assert config.lr_schedule.decay_steps == config.num_train_steps == 10_000
+    assert set(trainable_state) == {"nominal_adapter_in", "nominal_adapter_out", "null_force_token"}
+
+
+def test_null_adapter_is_bypassed_for_full_force():
+    class ToyModel:
+        action_out_proj = staticmethod(lambda hidden: hidden)
+        nominal_adapter_in = staticmethod(lambda hidden: hidden)
+        nominal_adapter_out = staticmethod(lambda hidden: jnp.ones_like(hidden[..., :2]))
+        nominal_adapter_pose_dims = 2
+
+    hidden = jnp.zeros((1, 2, 3), dtype=jnp.float32)
+
+    full = pi0_force.Pi0_Guidance._project_action_velocity(ToyModel(), hidden, "full")  # noqa: SLF001
+    null = pi0_force.Pi0_Guidance._project_action_velocity(ToyModel(), hidden, "null")  # noqa: SLF001
+
+    np.testing.assert_array_equal(full, np.zeros((1, 2, 3), dtype=np.float32))
+    np.testing.assert_array_equal(null[..., :2], np.ones((1, 2, 2), dtype=np.float32))
+    np.testing.assert_array_equal(null[..., 2:], np.zeros((1, 2, 1), dtype=np.float32))

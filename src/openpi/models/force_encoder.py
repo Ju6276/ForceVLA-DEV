@@ -22,10 +22,11 @@ class ForceEncoderConfig:
     aggregation: str = "last"
     sampling_rate_hz: float = 200.0
     window_ms: float = 100.0
+    max_sample_age_ms: float | None = None
     history_source: str = "timestamp_stream"
 
     def __post_init__(self):
-        if self.type not in {"instantaneous", "avg_pool", "max_pool", "tcn"}:
+        if self.type not in {"instantaneous", "tcn"}:
             raise ValueError(f"Unknown force encoder type: {self.type}")
         if self.aggregation not in {"last", "mean"}:
             raise ValueError(f"Unknown temporal aggregation: {self.aggregation}")
@@ -41,6 +42,8 @@ class ForceEncoderConfig:
             raise ValueError("dropout_rate must be in [0, 1)")
         if self.kernel_size < 1 or self.sampling_rate_hz <= 0 or self.window_ms <= 0:
             raise ValueError("kernel size, sampling rate, and window duration must be positive")
+        if self.max_sample_age_ms is not None and self.max_sample_age_ms <= 0:
+            raise ValueError("max_sample_age_ms must be positive when provided")
 
     @property
     def max_history_samples(self) -> int:
@@ -131,15 +134,3 @@ class TemporalTCNForceEncoder(nnx.Module):
             weights = mask[..., None].astype(x.dtype)
             pooled = jnp.sum(x * weights, axis=1) / jnp.maximum(jnp.sum(weights, axis=1), 1)
         return self.output_proj(pooled)
-
-
-def pool_force_history(history, mask, mode: str):
-    """Mask-aware non-learned temporal baselines."""
-    if mode == "avg_pool":
-        weights = mask[..., None].astype(history.dtype)
-        return jnp.sum(history * weights, axis=1) / jnp.maximum(jnp.sum(weights, axis=1), 1)
-    if mode == "max_pool":
-        masked = jnp.where(mask[..., None], history, -jnp.inf)
-        pooled = jnp.max(masked, axis=1)
-        return jnp.where(jnp.isfinite(pooled), pooled, 0)
-    raise ValueError(f"Unsupported pooling mode: {mode}")

@@ -6,14 +6,15 @@ from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import openpi.models.model as _model
-import openpi.training.config as _config
 from openpi.training.async_force_dataset import NativeForceSidecarDataset
+import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.offline_targets import OfflineActionTargetDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -157,6 +158,14 @@ def create_torch_dataset(
         data_config.repo_id,
         delta_timestamps=delta_timestamps,
     )
+    if data_config.episodes is not None:
+        # LeRobot v2.1 indexes episode_data_index with the original episode id,
+        # which breaks sparse selections such as [0, 3, ..., 90]. Load the
+        # complete lightweight parquet index, then expose only selected rows.
+        # Videos remain lazy and are decoded only for selected observations.
+        episode_column = np.asarray(dataset.hf_dataset["episode_index"], dtype=np.int64)
+        selected_indices = np.flatnonzero(np.isin(episode_column, np.asarray(data_config.episodes)))
+        dataset = torch.utils.data.Subset(dataset, selected_indices.tolist())
 
     if data_config.native_force_sidecar is not None:
         sidecar = data_config.native_force_sidecar
@@ -279,6 +288,8 @@ def create_data_loader(
         num_workers=config.num_workers,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
+        offline_action_target_dir=config.offline_action_target_dir,
+        offline_action_target_key=config.offline_action_target_key,
     )
 
 
@@ -294,6 +305,8 @@ def create_torch_data_loader(
     num_batches: int | None = None,
     num_workers: int = 0,
     seed: int = 0,
+    offline_action_target_dir: str | None = None,
+    offline_action_target_key: str = "normalized_null_actions",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -314,6 +327,12 @@ def create_torch_data_loader(
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    if offline_action_target_dir is not None:
+        dataset = OfflineActionTargetDataset(
+            dataset,
+            offline_action_target_dir,
+            target_key=offline_action_target_key,
+        )
 
     data_loader = TorchDataLoader(
         dataset,

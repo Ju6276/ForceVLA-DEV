@@ -11,13 +11,6 @@ def test_history_sample_count_uses_physical_time():
     assert force_encoder.ForceEncoderConfig(sampling_rate_hz=30, window_ms=100).max_history_samples == 3
 
 
-def test_masked_pooling_ignores_padding():
-    history = jnp.asarray([[[99.0] * 6, [1.0] * 6, [3.0] * 6]])
-    mask = jnp.asarray([[False, True, True]])
-    np.testing.assert_allclose(force_encoder.pool_force_history(history, mask, "avg_pool"), 2.0)
-    np.testing.assert_allclose(force_encoder.pool_force_history(history, mask, "max_pool"), 3.0)
-
-
 def test_tcn_is_causal_and_preserves_sequence_length():
     config = force_encoder.ForceEncoderConfig(
         type="tcn", hidden_dims=(8, 8), dilations=(1, 2), aggregation="last", dropout_rate=0.0

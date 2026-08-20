@@ -1,3 +1,5 @@
+import pickle
+
 import numpy as np
 
 from openpi import transforms
@@ -14,6 +16,18 @@ class _FakeLowRateDataset:
     def __getitem__(self, index):
         del index
         return {"episode_index": np.asarray(0), "timestamp": np.asarray(self._timestamp)}
+
+
+def test_native_force_sidecar_dataset_is_picklable_for_spawn_workers(tmp_path):
+    np.savez(
+        tmp_path / "episode_000000.npz",
+        force=np.zeros((2, 6), dtype=np.float32),
+        timestamps=np.asarray([0.0, 0.01]),
+    )
+    dataset = NativeForceSidecarDataset(_FakeLowRateDataset(0.01), data_dir=tmp_path)
+    restored = pickle.loads(pickle.dumps(dataset))
+
+    np.testing.assert_array_equal(restored[0]["observation.force"], np.zeros((2, 6), dtype=np.float32))
 
 
 def test_200hz_sidecar_joins_by_episode_and_extracts_causal_window(tmp_path):

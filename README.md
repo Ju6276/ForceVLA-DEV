@@ -1,80 +1,80 @@
-# ForceVLA: Enhancing VLA Models with a Force-aware MoE for Contact-rich Manipulation
-## 
-ForceVLA is based on the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based diffusion vision-language-action model (VLA)； Both training and inference are based on π₀.
+# Temporal ForceVLA Teacher
 
-> **Teacher branch scope.** This branch builds a unified Temporal ForceVLA teacher by replacing
-> only the instantaneous force front-end with a configurable causal temporal encoder. FVLMoE, the
-> Action Expert, action representation, and flow-matching objective remain unchanged. Teacher-student
-> distillation, force-masked teacher passes, nominal/residual students, and slow-fast execution are
-> intentionally not implemented at this stage.
+本分支基于原始 [ForceVLA](https://github.com/THUDaDa/ForceVLA)，首先把 instantaneous 6D wrench
+前端替换为严格因果、按时间戳对齐的 temporal force encoder；在已经训练好的统一 Teacher 上，再为
+Teacher-guided slow/fast distillation 准备 full/null targets、force-free Slow VLA 和轻量 Fast residual
+student。
 
-## Requirements
+## 当前状态（2026-08-20）
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+当前选用的 Button Press 路线只有这一条：
 
-| Mode               | Memory Required | Example GPU        |
-| ------------------ | --------------- | ------------------ |
-| Inference          | > 8 GB          | RTX 4090           |
-| Fine-Tuning (LoRA) | > 22.5 GB       | RTX 4090           |
-| Fine-Tuning (Full) | > 70 GB         | A100 (80GB) / H100 |
-
-The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
-
-
-## dataset
-https://huggingface.co/datasets/qiaojunyu/ForceVLA-real-data
-
-## Installation
-
-When cloning this repo, make sure to update submodules:
-
-```bash
-conda create -n forcevla python=3.11 -y
-
+```text
+Stage 1  Temporal ForceVLA Teacher
+                  ↓ freeze
+Stage 2  同一 Teacher 增加 null-force 条件能力
+                  ↓ freeze
+Stage 3  离线提取 matched full/null targets
+                  ↓
+Stage 4  独立、无 Force 前端的 Slow nominal VLA
+                  ↓ freeze
+Stage 5  Intent Projector + Fast force residual student
 ```
 
-```bash
-python -m pip install --upgrade pip setuptools wheel
-conda install -c nvidia cuda-toolkit=12.8
+| 项目 | 当前状态 | 本地产物 |
+| --- | --- | --- |
+| USB instantaneous baseline | 已训练 | step `39999` |
+| USB 30 Hz Temporal Teacher | 已训练 | step `40000` |
+| Button 100 Hz-force Temporal Teacher（Stage 1） | 已训练 | step `39999` |
+| Button null-force adaptation（Stage 2） | 已训练 | step `9999` |
+| Button matched target extraction（Stage 3） | 已完成 | train 30,675 rows / 56 episodes；val 6,429 rows / 10 episodes |
+| Force-free Slow VLA（Stage 4） | 配置、真实数据、target、forward/gradient/resume 已验证；未正式训练 | 无 checkpoint |
+| Fast residual student（Stage 5） | 模型、loss、异步 runtime 和单元测试已实现；尚未接入正式训练入口 | 无 checkpoint |
+
+当前没有训练进程。checkpoint、W&B 本地目录和二进制 targets 均被 Git 忽略，不会随代码推送。
+
+已删除的旧方案包括：low-pass nominal target、固定力阈值/free-space loss、USB Stage 2A/2B、
+`avg_pool/max_pool` force encoder、相关旧评估脚本和 checkpoints。当前代码只保留 instantaneous、
+Temporal TCN、Button null-BC 和选定的 Slow/Fast 路线。
+
+## Stage 1：Temporal ForceVLA Teacher
+
+### 不变的 ForceVLA 主体
+
+Stage 1 只替换 force front-end。以下部分保持原始 ForceVLA 设计：
+
+- vision/language backbone；
+- robot-state pathway；
+- FVLMoE / force-aware fusion；
+- Action Expert；
+- action chunk 表示；
+- flow-matching objective；
+- 数据集原有的 RGB/state/action 行频率。
+
+### 两种 force encoder
+
+`ForceEncoderConfig.type` 只保留当前使用的两种模式：
+
+- `instantaneous`：原始 ForceVLA，当前 6D wrench 经过原始 `6 → 2048` 投影；
+- `tcn`：当前 temporal Teacher。
+
+TCN 使用 FAVLA-style 宽度配置，但不声称逐层复现 FAVLA：
+
+```text
+input: B × N × 6
+per-sample stem: 6 → 1024
+4 causal residual TCN blocks: 1024 → 1024
+dilations: 1, 2, 4, 8
+aggregation: last causal grid state
+output projection: 1024 → 2048
+output: one 2048D force token
 ```
 
-```bash
-cd lerobot/
-conda install ffmpeg=7.1.1 -c conda-forge
-pip install -e .
-```
+每个 temporal block 包含两层 `kernel_size=3` Conv1D、LayerNorm、SiLU、dropout 和残差连接。
+Conv1D 只做左侧 padding，因此不会读取未来 force。最终仍只向原始 FVLMoE 接口提供一个 2048D
+force token，窗口变长不会增加 token 数量。
 
-```bash
-cd ./openpi
-pip install -e .
-```
-
-```bash
-cd dlimp/
-pip install -e .
-```
-
-```bash
-cd packages/
-cd openpi-client/
-pip install -e .
-```
-
-```bash
-cd flaxformer/
-pip install -e .
-```
-## train policy
-```bash
-export HF_LEROBOT_HOME="xxxxxx"
-python scripts/compute_norm_stats.py --config-name forcevla_lora 
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9  python scripts/train.py forcevla_lora --exp-name=my_experiment --overwrite  --batch_size 32 --save_interval 2000 --keep_period 10000
-```
-
-### Temporal force front-end
-
-ForceVLA retains its checkpoint-compatible instantaneous front-end by default. The model's
-`force_encoder.type` can be set to `instantaneous`, `avg_pool`, `max_pool`, or `tcn`. For example:
+示例：
 
 ```python
 Pi0_GuidanceConfig(
@@ -86,147 +86,257 @@ Pi0_GuidanceConfig(
         window_ms=100,
         hidden_dims=(1024, 1024, 1024, 1024),
         dilations=(1, 2, 4, 8),
-        dropout_rate=0.1,
-        aggregation="last",  # or "mean"
-        history_source="timestamp_stream",  # or "aligned_state" for released 30 Hz ForceVLA data
+        aggregation="last",
+        history_source="timestamp_stream",
     ),
 )
 ```
 
-Temporal modes expect each raw dataset item to retain `observation.force` as `[N, 6]`,
-`observation.force_timestamps` as `[N]`, and the VLA `timestamp` as a scalar (all timestamps in
-seconds). `LeRobotForcevlaDataConfig` exposes these key names. It extracts only samples in
-`(timestamp - window_ms, timestamp]`, keeps native-rate samples, and returns a left-padded history
-plus validity mask. FVLMoE, the Action Expert, action target, and training objective are unchanged.
+### 高频力的 timestamp alignment
 
-The released ForceVLA LeRobot data stores one wrench inside `observation.state` per 30 Hz frame.
-For a low-rate compatibility experiment, set `history_source="aligned_state"` and
-`sampling_rate_hz=30`; the loader requests causal negative frame offsets and never labels this as
-native-rate force.
-
-The named training configs make the mode explicit:
+RGB/state/action 与 force 保留各自的时间戳，不要求 frame 数一致。LeRobot dataset 仍以原始 VLA 行
+索引；每个 episode 的独立高频力流存为 sidecar：
 
 ```text
-forcevla_lora                    = original instantaneous 6D force
-forcevla_temporal_lora_aligned   = RGB-aligned force history through the causal TCN (30 Hz default)
-forcevla_usb_lora                = USB insertion instantaneous baseline
-forcevla_usb_temporal_lora_aligned = USB insertion 30 Hz history through the causal TCN
+force/episode_000000.npz
+  force:      [M, 6]
+  timestamps: [M]
 ```
 
-To train the continuous 30 Hz history variant on the released ForceVLA-style data:
+Button named configs 默认从 `data/panda_button_press_100hz_causal/raw_sidecars` 读取；可以把该目录做成
+指向实际数据位置的软链接，或在配置中改为自己的路径。`data/` 被 Git 忽略。
 
-```bash
-python scripts/compute_norm_stats.py --config-name forcevla_temporal_lora_aligned
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train.py \
-    forcevla_temporal_lora_aligned \
-    --exp-name=forcevla_temporal_30hz \
-    --overwrite \
-    --batch_size=4
+对每个 VLA timestamp `t_k`，代码只使用 `(t_k - window, t_k]` 中已到达的 force。固定采样率模式
+生成因果时间网格，每个 grid point 使用不晚于该点的最新原始 sample（causal zero-order hold）；
+过旧或缺失值填 0，并在 `force_history_mask` 中标为 invalid。
+
+Button Press 当前使用 `100 Hz × 100 ms`：
+
+```text
+t_k - 90 ms, t_k - 80 ms, ..., t_k
+            10 个 6D wrench slots
 ```
 
-Change the `repo_id` in `forcevla_temporal_lora_aligned` to select another ForceVLA-format task. Do
-not launch `forcevla_lora` when intending to use history: that named config deliberately preserves
-the original instantaneous baseline. The aligned config defaults to the released dataset's 30 Hz.
-For a dataset where RGB, state, and force are all 20 Hz, set `sampling_rate_hz=20`; the same 100 ms
-physical window then contains 2 force frames. The configured sampling rate must match the dataset
-FPS because the model input shape is static at initialization.
+这里的 100 Hz 只表示一个 VLA row 内部的 force-history 分辨率。RGB、state 和 action label 仍保持
+原数据频率，并没有被伪造为 100 Hz。相同物理窗口下：
 
-For the released USB insertion task, point `HF_LEROBOT_HOME` at the directory containing
-`flexiv_insert_USB_inputForce`, then run the two controlled experiments separately:
+```text
+200 Hz × 100 ms → 20 × 6
+300 Hz × 100 ms → 30 × 6
+```
+
+窗口长度是物理时间，不是写死的 frame 数；future sample 永远不会被选中。
+
+### 30 Hz aligned compatibility mode
+
+原始 ForceVLA 发布数据将一帧 wrench 放在 `observation.state`，与 RGB row 对齐。兼容实验使用：
+
+```python
+ForceEncoderConfig(
+    type="tcn",
+    sampling_rate_hz=30,
+    window_ms=100,
+    history_source="aligned_state",
+)
+```
+
+该模式得到约 3 帧历史，但不能称为 native-rate 高频力。
+
+## 当前配置
+
+| config name | 用途 |
+| --- | --- |
+| `forcevla_lora` | 原始 instantaneous ForceVLA |
+| `forcevla_temporal_lora_aligned` | 发布数据的 30 Hz temporal compatibility baseline |
+| `forcevla_usb_lora` | USB instantaneous 40k baseline |
+| `forcevla_usb_temporal_lora_aligned` | USB 30 Hz Temporal Teacher |
+| `forcevla_button_temporal_100hz` | Button 100 Hz-force Temporal Teacher |
+| `forcevla_button_temporal_100hz_val` | Button held-out episode loader |
+| `forcevla_button_temporal_stage2_null_bc` | 当前选用的 Button Stage 2 |
+| `forcevla_button_slow_lora` | 已准备、尚未正式训练的 Stage 4 Slow VLA |
+
+这些 LoRA config 沿用 OpenPI/ForceVLA 的 freeze filter：Gemma 主权重冻结，LoRA 参数可训练；视觉编码器
+和部分 robotics projections 仍可训练。因此它是仓库的 low-memory LoRA recipe，不是严格意义上的
+“只训练 LoRA matrices”。
+
+## Stage 2：同一 Teacher 的 null-force adaptation
+
+当前只保留 `forcevla_button_temporal_stage2_null_bc`。它从 Stage 1 step `39999` 初始化：
+
+- full-force 路径和全部 Stage 1 参数冻结；
+- 新增一个 2048D learned `null_force_token`；
+- 新增 rank-32、仅 null 条件启用的 Action-Expert adapter；
+- null 路径仍使用原始 expert action 和原始 flow-matching objective；
+- full 路径绕过 null token 和 null-only adapter，因此 Stage 1 full-force 函数按结构保留；
+- 不使用 low-pass、固定 force threshold 或 free-space mask。
+
+Stage 2 让同一个 Teacher 在缺少 force 时仍能输出动作。它本身不能保证 `A_full - A_null` 已经是
+物理上最优或因果可识别的 residual；这个差值只称为 Teacher 的 force-induced deviation。
+
+## Stage 3：matched full/null target extraction
+
+冻结 Stage 2 Teacher，在同一样本、同一 flow noise 和同一采样设置下计算：
+
+```text
+A_full = Teacher(V, L, S, F_history)
+A_null = Teacher(V, L, S, null_force)
+
+A_nom_target = A_null
+delta_A_target = A_full[..., :6] - A_null[..., :6]
+```
+
+Button targets 已完整保存到：
+
+```text
+artifacts/button_stage3_paired_targets/train
+artifacts/button_stage3_paired_targets/val
+```
+
+targets 位于 ForceVLA normalized action space，并按 split-local dataset row 顺序保存。训练/验证以
+episode 划分，互不重叠。`artifacts/` 已加入 `.gitignore`，465 MB 二进制 targets 不会上传 GitHub。
+
+重新提取示例：
 
 ```bash
-export HF_LEROBOT_HOME=/home/d024/datasets/ForceVLA-real-data/data_lerobot
+python scripts/extract_forcevla_paired_targets.py \
+    --config-name=forcevla_button_temporal_stage2_null_bc \
+    --data-config-name=forcevla_button_temporal_stage2_null_bc \
+    --checkpoint=checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_null_bc/9999 \
+    --output-dir=artifacts/button_stage3_paired_targets/train
+```
+
+## Stage 4：Slow nominal VLA
+
+`forcevla_button_slow_lora` 是独立、无 Force 前端的标准 `Pi0Config`，不是带 null token 的 Teacher：
+
+```text
+Vision + Language → VLM context
+Robot State(7D) → state/action pathway
+                         ↓
+                  A_ref action chunk
+```
+
+Slow 只读取 7D robot state（xyz、rpy、gripper），不读取 instantaneous wrench 或 force history。
+训练 target 是 Stage 3 的 `normalized_null_actions`。它从 Stage 2 checkpoint 中加载结构兼容的 VLA/
+Action weights，但部署模型本身没有 ForceVLA force front-end、TCN 或 null token。
+
+当前已验证真实 dataset、target row 对齐、forward、gradient step 和 checkpoint resume；smoke checkpoint
+已经删除，尚未开始正式 10k 训练。
+
+若确认使用当前 `A_null` 作为第一版 nominal target，启动命令为：
+
+```bash
+unset WANDB_MODE
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+python scripts/train.py forcevla_button_slow_lora \
+    --exp-name=button_press_slow_null_distill \
+    --overwrite
+```
+
+配置：batch size 4、10k steps、500-step warmup、peak LR `2.5e-5`、final LR `2.5e-6`，
+step 5k 和 final 保存；W&B project 为 `forcevla`。
+
+## Stage 5：Fast residual student
+
+当前选定结构为：
+
+```text
+Force history: 10 × 6 @ 100 Hz × 100 ms
+        ↓
+Causal TCN: 6 → 1024, 4 × 1024 blocks, dilation 1/2/4/8
+        ↓
+1 × 1024D force token
+                                ┐
+Latest robot state: 7D ────────→ state token
+Cached Slow V-L context ───────→ 2 intent tokens
+Current interpolated A_ref: 7D ─→ reference token
+[chunk phase, context age] ─────→ time token
+Learned residual query ─────────→ query token
+                                ┘
+                  1 × Gemma-style decoder layer
+                                ↓
+                     single-step 6D delta_A
+```
+
+Fast 的 7D 输入是最新 robot state，不是 force。force 始终通过独立的 `10 × 6` causal TCN 路径进入。
+Fast TCN 不做 Teacher 的 `1024 → 2048` 输出投影，因为 Fast decoder 的 width 本身就是 1024。
+
+```text
+pi_fast(F[t-100ms:t], S_t, Z_intent, A_ref(t), phase/age) → delta_A[:6]
+
+A_cmd[:6] = A_ref[:6] + gate * delta_A
+A_cmd[6]  = A_ref[6]       # gripper 由 Slow 负责
+```
+
+已实现：
+
+- `src/openpi/models/slow_fast.py`：Intent Projector、Teacher-style TCN、1-layer Gemma-style
+  single-step residual expert；
+- `src/openpi/training/slow_fast_distillation.py`：paired targets、Slow loss、residual + reconstruction loss；
+- `src/openpi/serving/slow_fast_runtime.py`：原子 Slow packet cache、按 timestamp 插值 `A_ref`、
+  phase/age 和 `A_ref + delta_A` composition。
+
+尚未完成：
+
+- 从正式训练后的 Slow VLA 导出并缓存 V-L hidden context；
+- 把 Slow prediction、intent、force/state/reference/time feature 接成正式 Fast dataset；
+- Fast `TrainConfig`、checkpoint 和 held-out evaluation；
+- 真实机器人上的异步 slow/fast control loop。
+
+因此 Slow 现在可以单独正式训练；Fast 架构已经固定，但还不能直接开始正式训练。正确顺序是先训练并冻结
+Slow，再完成 Fast 数据/训练入口。
+
+## 安装
+
+仓库在 Ubuntu 22.04、Python 3.11 和 NVIDIA CUDA 环境下开发：
+
+```bash
+git clone --recurse-submodules <repo-url>
+cd ForceVLA-DEV
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install -e .
+pip install -e lerobot
+pip install -e packages/openpi-client
+```
+
+原始 ForceVLA 数据：<https://huggingface.co/datasets/qiaojunyu/ForceVLA-real-data>
+
+## Stage 1 训练示例
+
+```bash
+export HF_LEROBOT_HOME=/path/to/lerobot/root
 
 python scripts/compute_norm_stats.py --config-name forcevla_usb_lora
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_usb_lora \
-    --exp-name=forcevla_usb_instantaneous \
+    --exp-name=forcevla_usb_instantaneous_40k \
     --overwrite \
     --batch_size=4
+```
 
+USB temporal compatibility baseline：
+
+```bash
 python scripts/compute_norm_stats.py --config-name forcevla_usb_temporal_lora_aligned
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_usb_temporal_lora_aligned \
     --exp-name=forcevla_usb_temporal \
     --overwrite \
     --batch_size=4
 ```
 
-The two USB configs use separate normalization asset IDs, so computing temporal statistics cannot
-overwrite the instantaneous baseline statistics (or vice versa).
+`forcevla_lora`/`forcevla_usb_lora` 始终是 instantaneous baseline；训练 history model 时必须显式选择
+temporal config。所有本分支 ForceVLA config 的 W&B project 均为 `forcevla`。
 
-### Stage 2A: learned null-force token (after Stage 1)
+## 下一步决策
 
-Stage 2A is prepared but is not part of the Stage 1 temporal-teacher experiment. It loads the trained
-Stage 1 temporal Teacher, adds one learned 2048D missing-force token at the existing force-fusion
-interface, freezes every existing Teacher parameter, and optimizes only that token with the original
-ForceVLA flow-matching objective. This follows the learned missing-modality-template idea of
-[Missing Modality Token (MMT)](https://openaccess.thecvf.com/content/CVPR2025W/MULA2025/html/Ramazanova_Exploring_Missing_Modality_in_Multimodal_Egocentric_Datasets_CVPRW_2025_paper.html),
-but does not yet enable MMT random-replace training or nominal-residual distillation.
+继续训练前只需要决定一件事：是否接受当前 Stage 2 的 `A_null` 作为第一版 nominal target。
 
-The default Stage 2A loader expects the checkpoint produced by the temporal command above:
+- 若接受：正式训练 Stage 4 Slow 10k，先做 held-out validation，再完成 Fast 训练入口；
+- 若不接受：先修改 Stage 2 的 nominal 定义并重新提取 Stage 3 targets，不应直接训练 Slow。
 
-```text
-./checkpoints/forcevla_usb_temporal_lora_aligned/forcevla_usb_temporal/49999/params
-```
-
-After Stage 1 finishes, run:
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python scripts/train.py \
-    forcevla_usb_temporal_stage2a_null \
-    --exp-name=forcevla_usb_stage2a_null \
-    --overwrite \
-    --batch_size=4
-```
-
-Do not recompute normalization statistics for Stage 2A. Its configuration deliberately reuses the
-Stage 1 temporal statistics from
-`./assets/forcevla_usb_temporal_lora_aligned/flexiv_insert_USB_inputForce_temporal_30hz` because the
-dataset and input representation are identical.
-
-To initialize from another Stage 1 checkpoint, override the path:
-
-```bash
-python scripts/train.py forcevla_usb_temporal_stage2a_null \
-    --exp-name=forcevla_usb_stage2a_null \
-    --weight-loader.params-path=/absolute/path/to/stage1/params \
-    --overwrite \
-    --batch_size=4
-```
-
-Because only `null_force_token` is trainable in Stage 2A, the stored Stage 1 full-force computation
-is unchanged by optimization. The full/null/retain joint loss belongs to an optional Stage 2B if a
-single token is insufficient; it is deliberately not active in this config.
-
-Stage 2A uses a schedule matched to its shorter 10,000-step horizon: 500 warmup steps, peak learning
-rate `2.5e-5`, cosine decay over 10,000 steps, and final learning rate `2.5e-6`.
-
-For future native-rate datasets, the loader can keep LeRobot RGB/state/action rows at their original
-rate and join one timestamped NPZ force sidecar per episode. Each sidecar must use the same
-episode-relative clock as the LeRobot `timestamp` and contain `force: [M, 6]` plus
-`timestamps: [M]`, for example `force/episode_000000.npz`. Configure it with:
-
-```python
-LeRobotForcevlaDataConfig(
-    repo_id="your/lerobot_dataset",
-    native_force_sidecar=NativeForceSidecarConfig(data_dir="/data/force"),
-)
-```
-
-The corresponding model config must use the native timestamp stream:
-
-```python
-Pi0_GuidanceConfig(
-    paligemma_variant="gemma_2b_lora",
-    action_expert_variant="gemma_300m_lora",
-    force_encoder=ForceEncoderConfig(
-        type="tcn",
-        sampling_rate_hz=200,
-        window_ms=100,
-        history_source="timestamp_stream",
-    ),
-)
-```
-
-At 200 Hz with a 100 ms window, each 30 Hz VLA/RGB row retrieves the 20 wrench samples in
-`(timestamp - 100 ms, timestamp]`. The sidecar is cached per episode, future samples are excluded,
-and neighboring RGB rows may correctly use overlapping force windows.
+当前仓库不宣称 Temporal 一定优于 Instantaneous，也不宣称 non-zero `A_full - A_null` 已经证明了
+有效 slow/fast 控制分解；最终结论必须来自 held-out 和在线机器人实验。
