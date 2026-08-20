@@ -231,19 +231,41 @@ def main() -> None:
             )
 
         if step % args.eval_interval == 0 or step == args.steps - 1:
-            totals = []
-            for start in range(0, len(fixed_eval_indices), args.batch_size):
-                batch_indices = fixed_eval_indices[start : start + args.batch_size]
-                if len(batch_indices) < args.batch_size:
-                    batch_indices = np.pad(batch_indices, (0, args.batch_size - len(batch_indices)), mode="edge")
+            eval_indices = (
+                np.arange(len(val_arrays.dataset_indices), dtype=np.int64)
+                if step == args.steps - 1
+                else fixed_eval_indices
+            )
+            totals: list[tuple[int, dict]] = []
+            for start in range(0, len(eval_indices), args.batch_size):
+                batch_indices = eval_indices[start : start + args.batch_size]
                 loss, parts = eval_step(model, _make_batch(val_arrays, val_cache, batch_indices))
-                totals.append({"loss": loss, **parts})
+                totals.append((len(batch_indices), {"loss": loss, **parts}))
+            total_examples = sum(count for count, _ in totals)
             val_metrics = {
-                f"val/{name}": float(np.mean([float(jax.device_get(item[name])) for item in totals]))
-                for name in totals[0]
+                f"val/{name}": sum(
+                    count * float(jax.device_get(item[name])) for count, item in totals
+                )
+                / total_examples
+                for name in totals[0][1]
             }
-            zero_residual_mse = float(np.mean(np.square(val_arrays.residual_pose[fixed_eval_indices])))
+            zero_residual_mse = float(np.mean(np.square(val_arrays.residual_pose[eval_indices])))
+            reference_only_mse = float(
+                np.mean(
+                    np.square(
+                        val_cache.reference_actions[eval_indices, : config.pose_dims]
+                        - val_arrays.full_pose[eval_indices]
+                    )
+                )
+            )
             val_metrics["val/zero_residual_mse"] = zero_residual_mse
+            val_metrics["val/reference_only_reconstruction_mse"] = reference_only_mse
+            val_metrics["val/residual_gain_vs_zero"] = 1.0 - val_metrics["val/residual_loss"] / max(
+                zero_residual_mse, 1e-12
+            )
+            val_metrics["val/reconstruction_gain_vs_reference"] = 1.0 - val_metrics[
+                "val/reconstruction_loss"
+            ] / max(reference_only_mse, 1e-12)
             wandb.log(val_metrics, step=step)
             print(
                 f"val step={step} residual={val_metrics['val/residual_loss']:.6f} "
