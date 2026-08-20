@@ -482,8 +482,14 @@ class Pi0_Guidance(_model.BaseModel):
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Array | None = None,
     ):
-        """Run the null path once and expose its contextualized prefix for intent projection."""
+        """Run the null path once and expose its contextualized prefix for intent projection.
+
+        Passing the same row-keyed noise the paired extraction used makes this
+        reproduce that run's `A_null` exactly, which lets the Slow reference be the
+        Teacher's own null path instead of a separately distilled approximation.
+        """
         if self.null_force_token is None:
             raise ValueError("Nominal context sampling requires a learned null_force_token")
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -497,6 +503,7 @@ class Pi0_Guidance(_model.BaseModel):
             prefix_mask=prefix_mask,
             prefix_out_fix=prefix_out_fix,
             kv_cache=kv_cache,
+            noise=noise,
         )
         return actions, prefix_out_fix, prefix_mask
 

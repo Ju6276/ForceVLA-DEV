@@ -29,6 +29,15 @@ class SlowPacket:
     reference_actions: np.ndarray
     action_period_s: float
     version: int
+    # The unnormalized robot state this chunk was conditioned on. ForceVLA trains on
+    # delta actions, so the whole chunk is expressed relative to the pose at the Slow
+    # observation. Undoing that with the pose at execution time instead would bias
+    # every command by however far the arm travelled while Slow was thinking.
+    state_at_observation: np.ndarray | None = None
+    # Validity of `intent_tokens`. The Fast student takes a context mask during
+    # training, so serving has to carry one rather than assume every pooled bin is
+    # populated.
+    intent_mask: np.ndarray | None = None
     # Copied from the Slow cache the Fast student was trained on. Keeping it on the
     # packet stops the serving loop from silently scaling the time token differently
     # than training did.
@@ -48,6 +57,12 @@ class SlowPacket:
             raise ValueError("ready_timestamp cannot precede observation_timestamp")
         if self.version < 0:
             raise ValueError("Slow packet version must be non-negative")
+        if self.state_at_observation is not None:
+            state = np.asarray(self.state_at_observation)
+            if state.ndim != 1 or not np.all(np.isfinite(state)):
+                raise ValueError("state_at_observation must be a finite 1D robot state")
+        if self.intent_mask is not None and np.asarray(self.intent_mask).shape != intent.shape[:1]:
+            raise ValueError(f"intent_mask must be [{intent.shape[0]}], got {np.shape(self.intent_mask)}")
 
     @property
     def horizon_end(self) -> float:
@@ -155,3 +170,32 @@ def compose_reference_residual(
     result = reference.copy()
     result[:pose_dims] += float(np.clip(gate, 0.0, 1.0)) * correction
     return result
+
+
+def to_absolute_command(
+    composed_action,
+    packet: SlowPacket,
+    unnormalize,
+    *,
+    delta_dims: int = 6,
+) -> np.ndarray:
+    """Turn a normalized composed action into an absolute command for the robot.
+
+    This inverts the two training-side transforms in order: `Normalize`, then
+    `DeltaActions`. The delta dimensions are rebased onto the state the Slow packet
+    was conditioned on rather than the state at execution time; the gripper is
+    absolute already and is left untouched.
+    """
+    if packet.state_at_observation is None:
+        raise ValueError("Undoing delta actions needs the state the Slow packet was conditioned on")
+    action = np.asarray(composed_action, dtype=np.float32)
+    if action.ndim != 1 or action.shape[0] < delta_dims:
+        raise ValueError(f"Expected a 1D action with at least {delta_dims} dimensions, got {action.shape}")
+    physical = np.asarray(unnormalize(action), dtype=np.float32)
+    if physical.shape != action.shape:
+        raise ValueError(f"Unnormalize changed the action shape from {action.shape} to {physical.shape}")
+    state = np.asarray(packet.state_at_observation, dtype=np.float32)
+    if state.shape[0] < delta_dims:
+        raise ValueError(f"state_at_observation needs at least {delta_dims} dimensions, got {state.shape}")
+    physical[:delta_dims] += state[:delta_dims]
+    return physical

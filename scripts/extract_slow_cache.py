@@ -14,6 +14,7 @@ import dataclasses
 import json
 import pathlib
 import time
+import typing
 
 from flax import nnx
 import jax
@@ -22,6 +23,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as model_lib
+from openpi.models import pi0_force
 from openpi.models import slow_fast
 from openpi.shared import nnx_utils
 from openpi.training import config as config_lib
@@ -69,9 +71,30 @@ def _checkpoint_params_path(checkpoint: pathlib.Path) -> pathlib.Path:
     return checkpoint if checkpoint.name == "params" else checkpoint / "params"
 
 
+def _slow_sampler(model) -> tuple[typing.Callable, str]:
+    """Pick the Slow reference source: a distilled force-free pi0, or the Teacher itself.
+
+    Running the frozen Teacher's null path removes the Stage-4 distillation gap
+    entirely: `A_ref` and `A_null` then come from the same network under the same
+    row-keyed noise, so the only reference error left is temporal staleness, which
+    is what the Fast time features exist to absorb.
+    """
+    if isinstance(model, pi0_force.Pi0_Guidance):
+        return model.sample_nominal_actions_and_context, "teacher_null_path"
+    return model.sample_actions_and_context, "distilled_slow_vla"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", required=True)
+    parser.add_argument(
+        "--data-config-name",
+        default=None,
+        help=(
+            "Loader to read rows from, when it differs from the model config. Needed to run a "
+            "train-split model config over a held-out split, as the paired extraction does."
+        ),
+    )
     parser.add_argument("--stage3-dir", type=pathlib.Path, required=True)
     parser.add_argument("--checkpoint", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -126,7 +149,8 @@ def main() -> None:
     key_timestamps = stage3.timestamps[key_rows]
 
     config = dataclasses.replace(config_lib.get_config(args.config_name), batch_size=args.batch_size, num_workers=0)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    source_config = config if args.data_config_name is None else config_lib.get_config(args.data_config_name)
+    data_config = source_config.data.create(source_config.assets_dirs, config.model)
     raw_dataset = data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
     if len(raw_dataset) != len(stage3.dataset_indices):
         raise ValueError(f"Slow dataset has {len(raw_dataset)} rows but Stage-3 has {len(stage3.dataset_indices)}")
@@ -138,7 +162,9 @@ def main() -> None:
         str(_checkpoint_params_path(args.checkpoint)), missing_regex=r"a^"
     ).load(reference_state)
     model = config.model.load(params, remove_extra_params=False)
-    sample = nnx_utils.module_jit(model.sample_actions_and_context)
+    sampler, slow_source = _slow_sampler(model)
+    sample = nnx_utils.module_jit(sampler)
+    print(f"Slow reference source: {slow_source}", flush=True)
 
     context_parts = []
     context_mask_parts = []
@@ -201,9 +227,11 @@ def main() -> None:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     _atomic_savez(args.output, arrays)
+    null_pose = stage3.full_pose - stage3.residual_pose
     summary = {
         "format_version": 1,
         "config_name": args.config_name,
+        "data_config_name": args.data_config_name or args.config_name,
         "checkpoint": str(args.checkpoint.resolve()),
         "stage3_dir": str(args.stage3_dir.resolve()),
         "rows": len(stage3.dataset_indices),
@@ -213,8 +241,16 @@ def main() -> None:
         "context_age_scale_ms": args.context_age_scale_ms,
         "pooled_context_shape": list(context_tokens.shape),
         "action_chunk_shape": list(action_chunks.shape),
+        "slow_reference_source": slow_source,
+        # Splitting the reference error by age separates the two things that make
+        # A_ref differ from A_null. At a key row the age is zero, so whatever error
+        # remains is the Slow network's own; the gap to the all-row number is the
+        # cost of holding a stale chunk between updates.
         "reference_vs_teacher_null_first_pose_mse": float(
-            np.mean(np.square(reference_actions[:, :6] - (stage3.full_pose - stage3.residual_pose)))
+            np.mean(np.square(reference_actions[:, :6] - null_pose))
+        ),
+        "reference_vs_teacher_null_at_key_rows_mse": float(
+            np.mean(np.square(reference_actions[key_rows, :6] - null_pose[key_rows]))
         ),
         "elapsed_seconds": time.monotonic() - start_time,
     }

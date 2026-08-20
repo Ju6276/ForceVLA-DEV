@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from flax import nnx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -101,3 +102,34 @@ def test_null_adapter_is_bypassed_for_full_force():
     np.testing.assert_array_equal(full, np.zeros((1, 2, 3), dtype=np.float32))
     np.testing.assert_array_equal(null[..., :2], np.ones((1, 2, 2), dtype=np.float32))
     np.testing.assert_array_equal(null[..., 2:], np.zeros((1, 2, 1), dtype=np.float32))
+
+
+def test_nominal_context_sampling_forwards_the_row_keyed_noise():
+    """Slow can only replace the Stage-4 distillation if it reproduces A_null exactly.
+
+    The paired extraction and the Slow cache must therefore reach the flow sampler
+    with the same noise and the same null conditioning.
+    """
+    config = pi0_force.Pi0_GuidanceConfig(enable_null_force_token=True, force_condition="null")
+    noise = jnp.arange(config.action_horizon * config.action_dim, dtype=jnp.float32).reshape(
+        1, config.action_horizon, config.action_dim
+    )
+    recorded = {}
+
+    class Stub:
+        null_force_token = nnx.Param(jnp.zeros((4,), dtype=jnp.float32))
+
+        def _prepare_action_prefix(self, observation):
+            return "tokens", "mask", "prefix", "cache"
+
+        def _sample_actions_with_prefix(self, rng, observation, **kwargs):
+            recorded.update(kwargs)
+            return "actions"
+
+    actions, prefix, mask = pi0_force.Pi0_Guidance.sample_nominal_actions_and_context(
+        Stub(), jax.random.key(0), config.fake_obs(batch_size=1), num_steps=4, noise=noise
+    )
+
+    assert (actions, prefix, mask) == ("actions", "prefix", "mask")
+    assert recorded["force_condition"] == "null"
+    np.testing.assert_array_equal(recorded["noise"], noise)

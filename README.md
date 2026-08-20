@@ -206,7 +206,38 @@ python scripts/extract_forcevla_paired_targets.py \
     --output-dir=artifacts/button_stage3_paired_targets/train
 ```
 
-## Stage 4：Slow nominal VLA
+## Stage 4：Slow nominal reference
+
+Slow 参考现在有两个可选来源，`scripts/extract_slow_cache.py` 依据 `--config-name` 给出的模型类型
+自动选择，并把结果记在 cache summary 的 `slow_reference_source` 字段里。
+
+### 选项 A（推荐）：直接用冻结 Teacher 的 null 路径
+
+传入 Stage-2 config 时，脚本调用 `Pi0_Guidance.sample_nominal_actions_and_context`，即 Teacher 的
+null 路径。null 条件只是一个 learned constant token，**部署时不需要任何力输入**，所以它同样是一个
+force-free 的 Slow。
+
+这样做的意义是消掉 Stage-4 的蒸馏差距。只要 `--seed` 与 Stage-3 提取一致，两边的 flow noise 都由
+`row_keyed_noise` 按 dataset row 号生成，于是在每个 Slow key row 上 `A_ref` 与 `A_null` **逐位相同**
+（实测最大逐元素差 `0.000e+00`）。剩下的参考误差就只有更新间隔内的 chunk 陈旧度，而那正是 Fast 的
+phase/age 两个时间特征该负责吸收的部分。
+
+```bash
+python scripts/extract_slow_cache.py \
+    --config-name=forcevla_button_temporal_stage2_null_bc \
+    --data-config-name=forcevla_button_temporal_100hz_val \
+    --stage3-dir=artifacts/button_stage3_paired_targets/val \
+    --checkpoint=checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_null_bc/9999 \
+    --output=artifacts/button_slow_cache/val.npz
+```
+
+`--data-config-name` 用于让 train-split 的模型 config 跑在 held-out loader 上，与成对提取脚本的用法一致。
+
+cache summary 现在同时报告两个数：`reference_vs_teacher_null_at_key_rows_mse`（age 为 0，纯模型误差）
+和 `reference_vs_teacher_null_first_pose_mse`（全行，含陈旧误差）。两者之差就是 chunk 保持的代价。
+用选项 A 时前者应当为 0。
+
+### 选项 B（原方案）：独立蒸馏的 Slow VLA
 
 `forcevla_button_slow_lora` 是独立、无 Force 前端的标准 `Pi0Config`，不是带 null token 的 Teacher：
 
@@ -237,6 +268,10 @@ step 5k 和 final 保存；W&B project 为 `forcevla`。
 正式 Slow W&B run：<https://wandb.ai/ju-dong6276-technical-university-of-munich/forcevla/runs/1iactyn8>。
 10 Hz cache 中，interpolated `A_ref` 对 Stage-3 `A_null` 的 normalized pose MSE 为：train `0.03421`，
 held-out `0.03127`。
+
+这个 `0.03127` 是选项 B 的代价，也是当前整个系统的主导误差项（见下节的误差账本）。它与 Teacher
+自身对真实 expert 的误差（`0.0336`–`0.0438`）同量级，等于把误差预算翻了一倍。选项 A 把这一项
+在 key row 上直接降到 0，因此除非有必须去掉 Teacher 权重的部署约束，否则不建议再用选项 B。
 
 ## Stage 5：Fast residual student
 
@@ -302,6 +337,63 @@ Slow prediction/interpolation error。脚本保留 `--reconstruction-weight` 作
 `15.34×` 和 `17.67×`，说明 Fast 不是只依赖 Slow context/state/reference 猜 residual。组合指标中，
 `A_ref + delta_A_fast` 对 `A_full` 的 MSE 为 `0.03058`，仅 `A_ref` 为 `0.03526`，改善 `13.26%`；
 当前最终控制误差仍主要受 Slow reference error 限制。
+
+### 误差账本：为什么组合改善只有 13%
+
+部署时执行 `A_ref + delta`，它对 Teacher 的偏差**在向量层面**精确分解为一个与力无关的 Slow 项和
+一个 Fast 项：
+
+```text
+(A_ref + delta) - A_full = (A_ref - A_null) + (delta - (A_full - A_null))
+                            └── Slow 项 ──┘   └───── Fast 项，唯一被训练的 ─────┘
+```
+
+held-out 各项（normalized action space）：
+
+| 项 | MSE | RMS |
+| --- | ---: | ---: |
+| Slow 误差 `A_ref - A_null` | `0.03127` | `0.177` |
+| 力修正信号本身 `A_full - A_null` | `0.00537` | `0.073` |
+| Fast 误差 `delta - (A_full - A_null)` | `0.00061` | `0.025` |
+| 实际部署 `A_ref + delta` vs `A_full` | `0.03058` | `0.175` |
+
+Fast 的精度是 Slow 的 7.2 倍（RMS）。关键在第二行：**Slow 的误差比 Fast 要贡献的整个力修正还大
+2.4 倍**，所以组合指标只有 13% 改善不是 Fast 的问题，是分母被 Slow 锁死。这是采用 Stage-4 选项 A
+的直接理由。
+
+注意两个 MSE **不能相加**：两项都含 `A_null`，存在交叉项。`train_fast_residual.py` 每步报告
+`slow_reference_error` 与 `deployment_error`，`evaluate_fast_residual.py` 报告
+`deployment_error_decomposition`，用法都是比较两项的量级，总量看 `total_mse`。
+
+### 已知未修复：两个时间特征目前都是退化的
+
+当前 30 Hz 数据行、10 Hz Slow、`action_horizon=50` 的组合下，实测：
+
+```text
+chunk 长度 H=50，实际用到的索引: [0, 1, 2]
+alpha 取值集合: {0.0, 1.0}            <- 线性插值分支从未真正激活
+训练 context age: {0, 33.3, 66.7} ms  -> 归一化后 {0, 0.33, 0.67}
+训练 phase:       {0, 0.020, 0.041}   <- 只覆盖 4% 的取值范围
+```
+
+30 整除 10，行时间戳精确落在 chunk 索引上，所以 `alpha` 恒为退化值，**Fast 从未见过插值出来的
+`A_ref`**。`phase` 的分母是 `(H-1)/30 = 1.63 s`，而 age 最大只有 67 ms，因此 phase 近似常数。
+
+部署侧更糟，把真实 Slow 推理延迟叠上去（当前 `context_age_scale` 为 100 ms）：
+
+| Slow 推理延迟 | 实际 age | 归一化 age |
+| ---: | --- | --- |
+| 80 ms | 80–147 ms | `0.80`–`1.00` |
+| 120 ms | 120–187 ms | `1.00`（完全饱和） |
+| 200 ms | 200–267 ms | `1.00`（完全饱和） |
+
+训练时 age 从未超过 `0.67`，部署时从第一帧起贴着 `1.0`。**这个特征在部署时是训练中从未出现过的
+常数。** 修复需要三件事一起做：实测 Slow 推理延迟并把 `context_age_scale` 设为覆盖「延迟 + 更新
+周期」的量级；在 cache 提取时注入该延迟，让 packet 在 `t_key + latency` 才可用；给 Slow 更新时刻
+加抖动，使 `alpha` 铺满 `[0,1)`。
+
+另外 `action_horizon=50` @ 30 Hz 是 1.67 s 的预测，10 Hz 更新只消费前 3 步。被丢弃的 lookahead
+正是 RTC/A2C2 一类方法用来掩盖推理延迟的资源。
 
 ### 对 ground-truth expert 的物理单位评估
 
@@ -477,12 +569,15 @@ temporal config。所有本分支 ForceVLA config 的 W&B project 均为 `forcev
 
 Stage 4/5 离线训练和 held-out force ablation 已完成。下一步按优先级是：
 
-1. 修复 roll 的 2π wrapping，重算 norm stats，重跑 Stage 1–5。在此之前旋转维度的所有结论无效；
-2. 单独降低 Slow `A_ref` 对 `A_null` 的误差，不让 Fast 补偿 force-agnostic Slow error。先用不同
-   `--slow-rate-hz` 重跑 cache 提取，把误差分解为 Slow 模型误差与 chunk 插值/外推误差；
-3. 对齐训练与部署的时间语义：`extract_slow_cache.py` 的 `--context-age-scale-ms` 默认 100 ms，
-   而 `slow_fast_runtime.reference_time_features` 默认 250 ms，两者必须一致；训练数据还应注入
-   真实的 Slow 推理延迟，当前允许 context age 为 0，这在真机上不可实现；
+1. 用 Stage-4 选项 A（Teacher null 路径）重新提取 train/val Slow cache，确认
+   `reference_vs_teacher_null_at_key_rows_mse` 为 0，并重跑 Fast，看部署误差从 `0.03058` 降到何处。
+   代码已就绪，这是当前投入产出比最高的一步；
+2. 修复 roll 的 2π wrapping，重算 norm stats，重跑 Stage 1–5。在此之前旋转维度的所有结论无效。
+   与上游 pi0 一致的做法是在 `src/openpi/policies/forcevla_policy.py` 里改旋转表示
+   （axis-angle 或 6D 连续表示），而不是给公共的 `transforms.DeltaActions` 打补丁——ALOHA/DROID
+   用关节空间、Libero 用 axis-angle，上游都是在表示层回避这个问题的；
+3. 重建时间语义（三件事必须一起做，见上节）：实测 Slow 推理延迟、按该延迟注入 packet 可用时刻、
+   给 Slow 更新时刻加抖动使插值分支真正被训练，并相应重设 `--context-age-scale-ms`；
 4. 按 timestamp 实现真实机器 10 Hz Slow / 高频 Fast 的异步执行；
 5. 在线测试安全门控、pose residual 限幅、gripper 由 Slow 独占，以及接触事件指标。
 
