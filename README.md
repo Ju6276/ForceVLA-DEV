@@ -277,6 +277,10 @@ A_cmd[6]  = A_ref[6]       # gripper 由 Slow 负责
   并为每个数据时间戳构造插值后的 `A_ref`；
 - `scripts/train_fast_residual.py`：正式 Fast optimizer、W&B、5k/final checkpoint 和 held-out validation。
 
+Fast 主实验只优化 `MSE(delta_A_fast, A_full-A_null)`。`A_ref+delta_A_fast` 对 `A_full` 的
+reconstruction MSE 只作为 validation metric；默认不把它加入训练 loss，避免 Fast 学习与 force 无关的
+Slow prediction/interpolation error。脚本保留 `--reconstruction-weight` 作为显式 ablation，默认值为 0。
+
 Slow 完成后，先提取 train/val cache：
 
 ```bash

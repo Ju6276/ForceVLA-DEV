@@ -118,7 +118,12 @@ def main() -> None:
     parser.add_argument("--peak-lr", type=float, default=1e-4)
     parser.add_argument("--end-lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--reconstruction-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--reconstruction-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary full-action reconstruction weight. Keep at zero for pure Teacher residual specialization.",
+    )
     parser.add_argument("--save-interval", type=int, default=5_000)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--eval-samples", type=int, default=2_048)
