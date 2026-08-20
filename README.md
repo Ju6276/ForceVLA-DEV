@@ -28,10 +28,10 @@ Stage 5  Intent Projector + Fast force residual student
 | Button 100 Hz-force Temporal Teacher（Stage 1） | 已训练 | step `39999` |
 | Button null-force adaptation（Stage 2） | 已训练 | step `9999` |
 | Button matched target extraction（Stage 3） | 已完成 | train 30,675 rows / 56 episodes；val 6,429 rows / 10 episodes |
-| Force-free Slow VLA（Stage 4） | 正式 10k 训练进行中，W&B online | step 5k / final 将保存 |
-| Fast residual student（Stage 5） | 正式 cache、训练、checkpoint、validation 入口和端到端 smoke 已验证；等待 Slow 完成 | 无正式 checkpoint |
+| Force-free Slow VLA（Stage 4） | 正式 10k 已完成 | step `5000`、`9999` |
+| Fast residual student（Stage 5） | 正式 10k、全 held-out evaluation 和 force ablation 已完成 | step `5000`、`10000` |
 
-checkpoint、W&B 本地目录和二进制 targets 均被 Git 忽略，不会随代码推送。
+当前没有训练进程。checkpoint、W&B 本地目录和二进制 targets 均被 Git 忽略，不会随代码推送。
 
 已删除的旧方案包括：low-pass nominal target、固定力阈值/free-space loss、USB Stage 2A/2B、
 `avg_pool/max_pool` force encoder、相关旧评估脚本和 checkpoints。当前代码只保留 instantaneous、
@@ -234,6 +234,10 @@ python scripts/train.py forcevla_button_slow_lora \
 配置：batch size 4、10k steps、500-step warmup、peak LR `2.5e-5`、final LR `2.5e-6`，
 step 5k 和 final 保存；W&B project 为 `forcevla`。
 
+正式 Slow W&B run：<https://wandb.ai/ju-dong6276-technical-university-of-munich/forcevla/runs/1iactyn8>。
+10 Hz cache 中，interpolated `A_ref` 对 Stage-3 `A_null` 的 normalized pose MSE 为：train `0.03421`，
+held-out `0.03127`。
+
 ## Stage 5：Fast residual student
 
 当前选定结构为：
@@ -281,6 +285,22 @@ Fast 主实验只优化 `MSE(delta_A_fast, A_full-A_null)`。`A_ref+delta_A_fast
 reconstruction MSE 只作为 validation metric；默认不把它加入训练 loss，避免 Fast 学习与 force 无关的
 Slow prediction/interpolation error。脚本保留 `--reconstruction-weight` 作为显式 ablation，默认值为 0。
 
+正式 Fast W&B run：<https://wandb.ai/ju-dong6276-technical-university-of-munich/forcevla/runs/dnivkphb>。
+
+全 held-out 6,429 rows 的结果：
+
+| 条件 | normalized residual MSE |
+| --- | ---: |
+| zero-residual baseline | `0.005374` |
+| Fast，正确 force history | `0.000611` |
+| Fast，force history 全零 | `0.009372` |
+| Fast，force history 随机打乱 | `0.010801` |
+
+正确 force 相对 zero-residual baseline 降低 `88.63%`；置零或打乱 force 后误差分别是正确 force 的
+`15.34×` 和 `17.67×`，说明 Fast 不是只依赖 Slow context/state/reference 猜 residual。组合指标中，
+`A_ref + delta_A_fast` 对 `A_full` 的 MSE 为 `0.03058`，仅 `A_ref` 为 `0.03526`，改善 `13.26%`；
+当前最终控制误差仍主要受 Slow reference error 限制。
+
 Slow 完成后，先提取 train/val cache：
 
 ```bash
@@ -308,6 +328,16 @@ python scripts/train_fast_residual.py \
     --val-slow-cache=artifacts/button_slow_cache/val.npz \
     --output-dir=checkpoints/button_press_fast_residual \
     --steps=10000 --batch-size=64
+```
+
+重新加载 final checkpoint 并运行 force 消融：
+
+```bash
+python scripts/evaluate_fast_residual.py \
+    --targets=artifacts/button_stage3_paired_targets/val \
+    --slow-cache=artifacts/button_slow_cache/val.npz \
+    --checkpoint=checkpoints/button_press_fast_residual/step-10000/params \
+    --output=artifacts/button_fast_evaluation/val_force_ablation.json
 ```
 
 仍未完成的是：真实机器人上的异步 slow/fast control loop。离线训练与 held-out evaluation 路径已经接通。
@@ -359,11 +389,11 @@ temporal config。所有本分支 ForceVLA config 的 W&B project 均为 `forcev
 
 ## 当前执行顺序
 
-1. 完成 Stage 4 Slow 10k；
-2. 提取 train/held-out Slow packets，并报告 `A_ref` 对 `A_null` 的误差；
-3. 完成 Stage 5 Fast 10k；
-4. 比较 held-out residual MSE 与 zero-residual baseline，并检查 `A_ref + delta_A` 对 `A_full` 的重建误差；
-5. 离线结果通过后，再实现真实机器异步执行。
+Stage 4/5 离线训练和 held-out force ablation 已完成。下一步是：
+
+1. 单独降低 Slow `A_ref` 对 `A_null` 的误差，不让 Fast 补偿 force-agnostic Slow error；
+2. 按 timestamp 实现真实机器 10 Hz Slow / 高频 Fast 的异步执行；
+3. 在线测试安全门控、pose residual 限幅、gripper 由 Slow 独占，以及接触事件指标。
 
 当前仓库不宣称 Temporal 一定优于 Instantaneous，也不宣称 non-zero `A_full - A_null` 已经证明了
 有效 slow/fast 控制分解；最终结论必须来自 held-out 和在线机器人实验。
