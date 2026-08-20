@@ -1,5 +1,6 @@
 from flax import nnx
 import jax
+import numpy as np
 import pytest
 
 from openpi.models import model as _model
@@ -73,6 +74,38 @@ def test_pi0_fast_lora_model():
 
     lora_state_elems = list(model_state.filter(lora_filter))
     assert len(lora_state_elems) > 0
+
+
+def test_row_keyed_noise_is_independent_of_batching_and_order():
+    rows = np.arange(37)
+    expected = np.asarray(_model.row_keyed_noise(0, rows, action_horizon=4, action_dim=7))
+
+    for batch_size in (1, 5, 16):
+        batched = np.concatenate(
+            [
+                np.asarray(_model.row_keyed_noise(0, rows[i : i + batch_size], action_horizon=4, action_dim=7))
+                for i in range(0, len(rows), batch_size)
+            ]
+        )
+        np.testing.assert_array_equal(batched, expected)
+
+    reversed_rows = np.asarray(_model.row_keyed_noise(0, rows[::-1], action_horizon=4, action_dim=7))
+    np.testing.assert_array_equal(reversed_rows, expected[::-1])
+
+    other_seed = np.asarray(_model.row_keyed_noise(1, rows, action_horizon=4, action_dim=7))
+    assert not np.allclose(other_seed, expected)
+    assert not np.allclose(expected[0], expected[1])
+
+
+def test_resolve_sample_noise_prefers_supplied_noise():
+    supplied = np.asarray(_model.row_keyed_noise(0, np.arange(3), action_horizon=4, action_dim=7))
+    np.testing.assert_array_equal(
+        np.asarray(_model.resolve_sample_noise(jax.random.key(9), supplied, shape=(3, 4, 7))), supplied
+    )
+    drawn = _model.resolve_sample_noise(jax.random.key(0), None, shape=(3, 4, 7))
+    assert drawn.shape == (3, 4, 7)
+    with pytest.raises(ValueError, match="Expected noise of shape"):
+        _model.resolve_sample_noise(jax.random.key(0), supplied, shape=(4, 4, 7))
 
 
 @pytest.mark.manual

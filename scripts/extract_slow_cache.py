@@ -22,6 +22,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as model_lib
+from openpi.models import slow_fast
 from openpi.shared import nnx_utils
 from openpi.training import config as config_lib
 from openpi.training import data_loader
@@ -74,17 +75,39 @@ def main() -> None:
     parser.add_argument("--stage3-dir", type=pathlib.Path, required=True)
     parser.add_argument("--checkpoint", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
-    parser.add_argument("--slow-rate-hz", type=float, default=10.0)
+    parser.add_argument(
+        "--slow-rate-hz",
+        type=float,
+        default=10.0,
+        help=(
+            "Slow update rate. Pass 0 to run Slow on every row; that full-rate cache can then "
+            "be resampled to any lower rate offline via scripts/resample_slow_cache.py."
+        ),
+    )
     parser.add_argument("--action-rate-hz", type=float, default=30.0)
-    parser.add_argument("--context-age-scale-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--context-age-scale-ms",
+        type=float,
+        default=slow_fast.DEFAULT_CONTEXT_AGE_SCALE_S * 1000.0,
+        help="Divisor for the Fast time token's context age. Serving must use the same value.",
+    )
     parser.add_argument("--context-tokens", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-steps", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Flow noise is keyed per dataset row from this seed. Match the Stage-3 seed so that "
+            "A_ref and A_null start from the same noise and their gap is not sampling variance."
+        ),
+    )
     args = parser.parse_args()
 
+    if args.slow_rate_hz < 0:
+        raise ValueError("Slow rate must be positive, or 0 for full-rate extraction")
     if min(
-        args.slow_rate_hz,
         args.action_rate_hz,
         args.context_age_scale_ms,
         args.context_tokens,
@@ -97,7 +120,7 @@ def main() -> None:
     key_rows, row_key_positions = fast_dataset.select_slow_update_rows(
         stage3.episode_indices,
         stage3.timestamps,
-        update_period_s=1.0 / args.slow_rate_hz,
+        update_period_s=(1.0 / args.slow_rate_hz) if args.slow_rate_hz > 0 else None,
     )
     key_episodes = stage3.episode_indices[key_rows]
     key_timestamps = stage3.timestamps[key_rows]
@@ -130,8 +153,15 @@ def main() -> None:
         np.testing.assert_allclose(
             timestamps[:valid_count], key_timestamps[batch_start : batch_start + valid_count], atol=1e-6, rtol=0
         )
-        rng = jax.random.fold_in(jax.random.key(args.seed), batch_start // args.batch_size)
-        actions, context, context_mask = sample(rng, observation, num_steps=args.num_steps)
+        noise = model_lib.row_keyed_noise(
+            args.seed,
+            stage3.dataset_indices[padded_rows],
+            action_horizon=config.model.action_horizon,
+            action_dim=config.model.action_dim,
+        )
+        actions, context, context_mask = sample(
+            jax.random.key(args.seed), observation, num_steps=args.num_steps, noise=noise
+        )
         pooled, pooled_mask = fast_dataset.pool_context_tokens(
             context,
             context_mask,
@@ -166,6 +196,8 @@ def main() -> None:
         "row_key_positions": row_key_positions,
         "reference_actions": reference_actions,
         "time_features": time_features,
+        "context_age_scale_s": np.float64(args.context_age_scale_ms / 1000.0),
+        "action_period_s": np.float64(1.0 / args.action_rate_hz),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     _atomic_savez(args.output, arrays)

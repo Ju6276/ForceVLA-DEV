@@ -25,11 +25,11 @@ Stage 5  Intent Projector + Fast force residual student
 | --- | --- | --- |
 | USB instantaneous baseline | 已训练 | step `39999` |
 | USB 30 Hz Temporal Teacher | 已训练 | step `40000` |
-| Button 100 Hz-force Temporal Teacher（Stage 1） | 已训练 | step `39999` |
-| Button null-force adaptation（Stage 2） | 已训练 | step `9999` |
-| Button matched target extraction（Stage 3） | 已完成 | train 30,675 rows / 56 episodes；val 6,429 rows / 10 episodes |
-| Force-free Slow VLA（Stage 4） | 正式 10k 已完成 | step `5000`、`9999` |
-| Fast residual student（Stage 5） | 正式 10k、全 held-out evaluation 和 force ablation 已完成 | step `5000`、`10000` |
+| Button Stage 1–5 | **全部产物已删除，待重跑** | 无 |
+
+Button 的 Stage 1–5 checkpoint、Stage-3 targets、Slow cache 和评估结果已于 2026-08-20 全部删除。
+原因是发现了 rpy delta 缺少角度折叠的数据缺陷（见下文），归一化把 roll 的尺度放大了 196 倍，
+导致此前所有 Button 训练都没有真正学习 roll。代码和 norm stats 已修复，需要从 Stage 1 重跑。
 
 当前没有训练进程。checkpoint、W&B 本地目录和二进制 targets 均被 Git 忽略，不会随代码推送。
 
@@ -303,6 +303,84 @@ Slow prediction/interpolation error。脚本保留 `--reconstruction-weight` 作
 `A_ref + delta_A_fast` 对 `A_full` 的 MSE 为 `0.03058`，仅 `A_ref` 为 `0.03526`，改善 `13.26%`；
 当前最终控制误差仍主要受 Slow reference error 限制。
 
+### 对 ground-truth expert 的物理单位评估
+
+以上都以 Teacher 的 `A_full` 为参考。`scripts/evaluate_fast_residual.py` 现在同时报告所有变体对
+**真实 expert action** 的误差，单位为米和弧度，并按接触状态分层。接触判据是相对 episode 静止 wrench
+的力偏差，而不是绝对幅值——原始 wrench 含约 5.5 N 的工具重力/传感器偏置，绝对阈值会把自由空间
+误判为接触。旋转维度的差值按 `(-pi, pi]` 折叠。
+
+held-out 6,429 rows（接触 2,446 / 自由空间 3,983，阈值 5 N）：
+
+| 分层 | 变体 | translation RMSE (m) | rotation RMSE (rad) |
+| --- | --- | ---: | ---: |
+| 接触 | Slow `A_ref` only | `0.02365` | `0.02680` |
+| 接触 | Slow + Fast residual | `0.02295` | `0.02874` |
+| 接触 | Teacher `A_null` | `0.02290` | `0.02233` |
+| 接触 | Teacher `A_full` | `0.02186` | `0.02149` |
+| 自由空间 | Slow `A_ref` only | `0.01164` | `0.02649` |
+| 自由空间 | Slow + Fast residual | `0.01110` | `0.02698` |
+
+结论分两部分：
+
+- **平移方向 Fast 是正收益。** 接触段 translation RMSE 从 `23.65 mm` 降到 `22.95 mm`（`+2.94%`），
+  自由空间 `+4.68%`。Teacher 自身的 force gain 在接触段为 translation `+4.55%`，所以 Fast 复现了
+  Teacher 力增益的约三分之二。
+- **旋转方向所有模型都没有学到。** roll RMSE 在 Slow、Teacher-null、Teacher-full、Fast 之间几乎不变
+  （`0.021`–`0.031` rad），Fast 甚至让接触段 roll 变差 `7.22%`。原因见下节的 roll wrapping 问题：
+  roll 在 normalized loss 中的权重被压低了约两个数量级，训练信号几乎为零。
+
+因为 roll 的平方误差与 z 方向相当，未加权的总 MSE 被这个未训练的维度主导，`fast vs slow-only` 的
+总 MSE 增益因此是负的（接触段 `-5.88%`）。在 roll 修好之前，总 MSE 不是有意义的模型选择指标；
+应当看分维度或分平移/旋转的数字。
+
+### 已知未修复的数据缺陷：欧拉角落在分支切点上
+
+上表中 rotation 的数字受一个已定位但**尚未修复**的缺陷影响。数据集的末端姿态用欧拉角记录
+（`observation.state` 的字段名即 `x, y, z, roll, pitch, yaw, gripper_width, force_*`），而 Button Press
+的末端静止在 roll ≈ ±π，正好落在欧拉角的分支切点上。同一个物理姿态因此被随机记成 `+3.1416`
+或 `-3.1416`。全量扫描的结果：
+
+| 数据集 | 帧数 | roll | pitch | yaw |
+| --- | ---: | --- | --- | --- |
+| Button Press（100 ep） | 56910 | 96.1% 在 +π 侧、3.9% 在 −π 侧，34 次相邻帧 2π 跳变 | 干净 | 干净 |
+| USB Insert（50 ep） | 34478 | 4 次 2π 跳变 | 最大值离 π 仅 0.12° | 4 次 2π 跳变 |
+
+这带来两个后果。一是 `transforms.DeltaActions` 逐维相减构造 delta action 时，这些帧产生 ±2π 的假
+delta：
+
+```text
+action roll = -3.1415, state roll = +3.1297
+naive delta = -6.2712      # 整整一圈
+真实姿态变化 = +0.0120
+```
+
+二是 norm stats 被污染。Button 的 state roll 以圆均值重新绕分支后真实 std 只有 `0.0067`，而记录值
+是 `1.2461`，**虚高 187 倍**。z-score 之后 roll 的真实变化被压缩到应有尺度的 1/187，这影响全部
+56910 帧而不只是那 34 次跳变，等于 Teacher / Slow / Fast 三级都几乎没有学过 roll。
+
+上游 pi0 不会踩到这个问题：ALOHA 和 DROID 用关节空间，Libero 用 axis-angle，这些表示下直接相减都
+是安全的。ForceVLA 是唯一对**绝对欧拉角**做减法的配置。为了与上游 ForceVLA / pi0 的管线保持一致，
+仓库目前**不打补丁**，保留原始行为。
+
+**所有 rotation 相关的既有 checkpoint 和评估结论都不成立**，上面那张 held-out 表格保留在此仅作
+基线参考。修复需要改变旋转表示（例如把姿态表达为相对某个标定参考系的偏差，或改用 6D 连续表示），
+并重算 norm stats、重跑 Stage 1–5。
+
+运行方式：
+
+```bash
+python scripts/evaluate_fast_residual.py \
+    --targets=artifacts/button_stage3_paired_targets/val \
+    --slow-cache=artifacts/button_slow_cache/val.npz \
+    --checkpoint=checkpoints/button_press_fast_residual/step-10000/params \
+    --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
+    --contact-threshold-n=5.0 \
+    --output=artifacts/button_fast_evaluation/val_expert_and_contact.json
+```
+
+省略 `--norm-stats-dir` 时退化为原来的 normalized-space、不分层报告。
+
 Slow 完成后，先提取 train/val cache：
 
 ```bash
@@ -343,6 +421,12 @@ python scripts/evaluate_fast_residual.py \
 ```
 
 仍未完成的是：真实机器人上的异步 slow/fast control loop。离线训练与 held-out evaluation 路径已经接通。
+
+另外，Stage 3 的 summary 显示 Teacher 的力条件对拟合 expert action 的帮助有限：normalized 全维
+`full_vs_expert` 为 train `0.03361` / val `0.04381`，`null_vs_expert` 为 train `0.03536` / val `0.04704`，
+相对改善只有 4.9% / 6.9%。考虑到 Stage 2 的 null 路径只有 1 个 token 加 rank-32 adapter 可训练，
+这个差距里还混着容量不对称的成分。在 roll wrapping 修好并重新评估之前，不应把 `A_full - A_null`
+当作已被验证的力修正量。
 
 ## 安装
 
@@ -391,11 +475,16 @@ temporal config。所有本分支 ForceVLA config 的 W&B project 均为 `forcev
 
 ## 当前执行顺序
 
-Stage 4/5 离线训练和 held-out force ablation 已完成。下一步是：
+Stage 4/5 离线训练和 held-out force ablation 已完成。下一步按优先级是：
 
-1. 单独降低 Slow `A_ref` 对 `A_null` 的误差，不让 Fast 补偿 force-agnostic Slow error；
-2. 按 timestamp 实现真实机器 10 Hz Slow / 高频 Fast 的异步执行；
-3. 在线测试安全门控、pose residual 限幅、gripper 由 Slow 独占，以及接触事件指标。
+1. 修复 roll 的 2π wrapping，重算 norm stats，重跑 Stage 1–5。在此之前旋转维度的所有结论无效；
+2. 单独降低 Slow `A_ref` 对 `A_null` 的误差，不让 Fast 补偿 force-agnostic Slow error。先用不同
+   `--slow-rate-hz` 重跑 cache 提取，把误差分解为 Slow 模型误差与 chunk 插值/外推误差；
+3. 对齐训练与部署的时间语义：`extract_slow_cache.py` 的 `--context-age-scale-ms` 默认 100 ms，
+   而 `slow_fast_runtime.reference_time_features` 默认 250 ms，两者必须一致；训练数据还应注入
+   真实的 Slow 推理延迟，当前允许 context age 为 0，这在真机上不可实现；
+4. 按 timestamp 实现真实机器 10 Hz Slow / 高频 Fast 的异步执行；
+5. 在线测试安全门控、pose residual 限幅、gripper 由 Slow 独占，以及接触事件指标。
 
 当前仓库不宣称 Temporal 一定优于 Instantaneous，也不宣称 non-zero `A_full - A_null` 已经证明了
 有效 slow/fast 控制分解；最终结论必须来自 held-out 和在线机器人实验。

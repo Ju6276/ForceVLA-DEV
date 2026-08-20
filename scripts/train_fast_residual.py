@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import pathlib
 import time
@@ -33,6 +34,7 @@ def _make_batch(arrays, cache, indices: np.ndarray) -> dict[str, jax.Array]:
         "time_features": jnp.asarray(cache.time_features[indices], dtype=jnp.float32),
         "target_residual": jnp.asarray(arrays.residual_pose[indices], dtype=jnp.float32),
         "target_full_pose": jnp.asarray(arrays.full_pose[indices], dtype=jnp.float32),
+        "target_null_pose": jnp.asarray(arrays.null_pose[indices], dtype=jnp.float32),
     }
 
 
@@ -60,10 +62,18 @@ def _loss(model, batch, loss_config, *, train: bool):
     )
     prediction_l2 = jnp.mean(jnp.linalg.norm(predicted, axis=-1))
     target_l2 = jnp.mean(jnp.linalg.norm(batch["target_residual"], axis=-1))
+    # What the robot actually executes is A_ref + delta. Its error against the Teacher
+    # splits, as vectors, into a force-agnostic Slow term and the Fast term the loss
+    # optimizes; only the latter is trained on. The mean squares carry a cross term and
+    # do not add up, so compare their magnitudes and read `deployment_error` for the sum.
+    pose_dims = loss_config.pose_dims
+    slow_error = jnp.mean(jnp.square(batch["reference_action"][..., :pose_dims] - batch["target_null_pose"]))
     return total, {
         **parts,
         "prediction_l2": prediction_l2,
         "target_l2": target_l2,
+        "slow_reference_error": slow_error,
+        "deployment_error": parts["reconstruction_loss"],
     }
 
 
@@ -133,6 +143,14 @@ def main() -> None:
     parser.add_argument("--wandb-project", default="forcevla")
     parser.add_argument("--wandb-name", default="button_press_fast_residual")
     parser.add_argument("--model-profile", choices=("selected", "smoke"), default="selected")
+    parser.add_argument(
+        "--no-reference-token",
+        action="store_true",
+        help=(
+            "Ablation: hide the Slow reference action from Fast. The residual target does not "
+            "depend on it, so this measures whether it carries anything the time features do not."
+        ),
+    )
     args = parser.parse_args()
 
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
@@ -149,6 +167,8 @@ def main() -> None:
     val_cache = fast_dataset.load_slow_cache(args.val_slow_cache, expected_rows=len(val_arrays.dataset_indices))
 
     config = _model_config(args.model_profile)
+    if args.no_reference_token:
+        config = dataclasses.replace(config, use_reference_token=False)
     slow_context_dim = int(train_cache.context_tokens.shape[-1])
     if val_cache.context_tokens.shape[-1] != slow_context_dim:
         raise ValueError("Train and validation Slow contexts have different widths")

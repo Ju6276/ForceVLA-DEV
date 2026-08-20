@@ -4,9 +4,11 @@ import pytest
 from openpi.serving import slow_fast_runtime
 
 
-def _packet(timestamp=1.0, version=0, ready_timestamp=None):
+def _packet(timestamp=1.0, version=0, ready_timestamp=None, context_age_scale_s=None):
     ready_timestamp = timestamp if ready_timestamp is None else ready_timestamp
+    extra = {} if context_age_scale_s is None else {"context_age_scale_s": context_age_scale_s}
     return slow_fast_runtime.SlowPacket(
+        **extra,
         observation_timestamp=timestamp,
         ready_timestamp=ready_timestamp,
         reference_start_timestamp=timestamp,
@@ -67,6 +69,22 @@ def test_sampling_compensates_slow_latency_and_builds_time_features():
         slow_fast_runtime.reference_time_features(packet, 1.15, context_age_scale_s=0.5),
         [0.75, 0.3],
     )
+
+
+def test_time_features_default_to_the_scale_carried_by_the_packet():
+    packet = _packet(timestamp=1.0, ready_timestamp=1.12, context_age_scale_s=0.5)
+    np.testing.assert_allclose(
+        slow_fast_runtime.reference_time_features(packet, 1.15), [0.75, 0.3]
+    )
+    # An explicit argument still overrides it, for probing a different scaling.
+    np.testing.assert_allclose(
+        slow_fast_runtime.reference_time_features(packet, 1.15, context_age_scale_s=0.25), [0.75, 0.6]
+    )
+
+
+def test_packet_rejects_a_non_positive_context_age_scale():
+    with pytest.raises(ValueError, match="context_age_scale_s must be positive"):
+        _packet(context_age_scale_s=0.0)
 
 
 def test_packet_cannot_be_consumed_before_ready():

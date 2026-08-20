@@ -1,3 +1,5 @@
+import dataclasses
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -56,6 +58,26 @@ def test_fast_residual_student_shapes_and_zero_safe_initialization():
     assert gate.shape == (2,)
     np.testing.assert_array_equal(residual, 0)
     np.testing.assert_array_equal(gate, 1)
+
+
+def test_decoder_lets_conditions_see_each_other_but_hides_the_query():
+    config = _config()
+    layer = slow_fast.GemmaStyleDecoderLayer(config, rngs=nnx.Rngs(0))
+    tokens = jax.random.normal(jax.random.key(0), (2, 7, config.width))
+    valid = jnp.ones((2, 7), dtype=jnp.bool_)
+    context_length = 6
+
+    baseline = layer(tokens, valid, context_length=context_length)
+    # Perturbing the trailing query must not leak into any condition's output.
+    perturbed = layer(
+        tokens.at[:, context_length:].add(10.0), valid, context_length=context_length
+    )
+    np.testing.assert_allclose(
+        baseline[:, :context_length], perturbed[:, :context_length], atol=1e-5
+    )
+    # A condition must react to the other conditions, which a causal mask forbade.
+    shifted = layer(tokens.at[:, -2].add(10.0), valid, context_length=context_length)
+    assert not np.allclose(baseline[:, 0], shifted[:, 0], atol=1e-5)
 
 
 def test_fast_residual_student_optional_gate_starts_at_half():
@@ -150,3 +172,35 @@ def test_stage5_head_projects_slow_context_and_predicts_one_step():
     assert residual.shape == (2, 6)
     assert gate.shape == (2,)
     assert intent.shape == (2, 2, 16)
+
+
+def test_decoder_treats_the_conditions_as_an_unordered_set():
+    """Conditions carry identity through type embeddings, not through position."""
+    layer = slow_fast.GemmaStyleDecoderLayer(_config(), rngs=nnx.Rngs(11))
+    rng = np.random.default_rng(0)
+    context_length = 5
+    tokens = jnp.asarray(rng.standard_normal((2, context_length + 1, 32)), jnp.float32)
+    mask = jnp.ones((2, context_length + 1), dtype=jnp.bool_)
+
+    baseline = layer(tokens, mask, context_length=context_length)
+    permutation = jnp.asarray([3, 0, 4, 1, 2, context_length])
+    shuffled = layer(tokens[:, permutation], mask, context_length=context_length)
+
+    np.testing.assert_allclose(baseline[:, -1], shuffled[:, -1], atol=1e-5)
+
+
+def test_dropping_the_reference_token_removes_its_projection():
+    model = slow_fast.FastForceResidualStudent(
+        dataclasses.replace(_config(), use_reference_token=False), rngs=nnx.Rngs(3)
+    )
+    assert model.reference_proj is None
+
+    residual, _ = model(
+        jnp.ones((2, 4, 6)),
+        jnp.ones((2, 4), dtype=jnp.bool_),
+        jnp.ones((2, 3, 16)),
+        jnp.ones((2, 8)),
+        jnp.ones((2, 7)),
+        jnp.zeros((2, 2)),
+    )
+    assert residual.shape == (2, 6)

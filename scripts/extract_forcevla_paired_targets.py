@@ -332,9 +332,15 @@ def main() -> None:
             if valid_count < args.batch_size:
                 batch_indices = np.pad(batch_indices, (0, args.batch_size - valid_count), mode="edge")
             observation, batch_arrays = _load_batch(raw_dataset, transform, batch_indices)
-            batch_number = batch_start // args.batch_size
-            sample_key = jax.random.fold_in(jax.random.key(args.seed), batch_number)
-            full, null, _, _ = sample_paired(sample_key, observation, num_steps=args.num_steps)
+            noise = model_lib.row_keyed_noise(
+                args.seed,
+                batch_indices,
+                action_horizon=config.model.action_horizon,
+                action_dim=config.model.action_dim,
+            )
+            full, null, _, _ = sample_paired(
+                jax.random.key(args.seed), observation, num_steps=args.num_steps, noise=noise
+            )
             full = np.asarray(full[:valid_count], dtype=np.float32)
             null = np.asarray(null[:valid_count], dtype=np.float32)
             batch_arrays.update(

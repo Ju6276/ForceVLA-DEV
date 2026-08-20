@@ -278,6 +278,36 @@ class BaseModel(nnx.Module, abc.ABC):
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
 
 
+def resolve_sample_noise(
+    rng: at.KeyArrayLike, noise: at.Array | None, *, shape: tuple[int, ...]
+) -> at.Array:
+    """Return caller-supplied flow noise, or draw it from `rng`.
+
+    Offline extraction passes noise keyed on the dataset row so that the same
+    row always starts from the same point, independent of batch size and shared
+    across extraction stages.
+    """
+    if noise is None:
+        return jax.random.normal(rng, shape)
+    if noise.shape != shape:
+        raise ValueError(f"Expected noise of shape {shape}, got {noise.shape}")
+    return noise.astype(jnp.float32)
+
+
+def row_keyed_noise(
+    seed: int, row_indices: np.ndarray, *, action_horizon: int, action_dim: int
+) -> jnp.ndarray:
+    """Draw flow noise keyed on each dataset row rather than on batch position.
+
+    Keeping the key tied to the row makes extraction reproducible under any
+    batch size and lets separate extraction stages start the same row from the
+    same noise, so their outputs can be compared without sampling variance.
+    """
+    base = jax.random.key(seed)
+    keys = jax.vmap(lambda row: jax.random.fold_in(base, row))(jnp.asarray(row_indices, dtype=jnp.uint32))
+    return jax.vmap(lambda key: jax.random.normal(key, (action_horizon, action_dim)))(keys)
+
+
 def restore_params(
     params_path: pathlib.Path | str,
     *,

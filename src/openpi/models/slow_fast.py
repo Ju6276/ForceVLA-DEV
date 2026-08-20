@@ -17,6 +17,11 @@ import jax.numpy as jnp
 
 import openpi.models.force_encoder as _force_encoder
 
+# The Fast time token is [chunk phase, context age / DEFAULT_CONTEXT_AGE_SCALE_S]. Offline
+# cache extraction and the online runtime must divide by the same number, otherwise the
+# deployed token lands outside the range the student was trained on.
+DEFAULT_CONTEXT_AGE_SCALE_S = 0.1
+
 
 @dataclasses.dataclass(frozen=True)
 class FastResidualConfig:
@@ -34,6 +39,11 @@ class FastResidualConfig:
     head_dim: int = 256
     dropout_rate: float = 0.0
     predict_gate: bool = False
+    # The residual target is the Teacher's A_full - A_null, which does not depend
+    # on the Slow reference the fast loop happens to be riding. Turning this off
+    # measures whether the reference token carries anything the time features do
+    # not already provide.
+    use_reference_token: bool = True
     force_encoder: _force_encoder.ForceEncoderConfig = dataclasses.field(
         default_factory=lambda: _force_encoder.ForceEncoderConfig(
             type="tcn",
@@ -160,19 +170,15 @@ class SlowNominalStudentAdapter(nnx.Module):
         return nominal_actions, self.intent_projector(prefix_context, prefix_mask)
 
 
-def _apply_rope(x, positions):
-    if x.shape[-1] % 2:
-        raise ValueError("RoPE head_dim must be even")
-    exponent = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
-    timescale = 10_000**exponent
-    radians = positions[..., None, None] / timescale[None, None, None, :]
-    sin, cos = jnp.sin(radians), jnp.cos(radians)
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(x.dtype)
-
-
 class GemmaStyleDecoderLayer(nnx.Module):
-    """One pre-norm Gemma-style GQA block used by the residual draft head."""
+    """One pre-norm Gemma-style GQA block used by the residual draft head.
+
+    The inputs are an unordered set of conditions rather than a sequence, so
+    there is no positional encoding: each condition is identified by its learned
+    type embedding. Index-based rotary embeddings would both invent an ordering
+    and make every token's encoding shift whenever the number of intent tokens
+    changes.
+    """
 
     def __init__(self, config: FastResidualConfig, *, rngs: nnx.Rngs):
         self.config = config
@@ -199,19 +205,20 @@ class GemmaStyleDecoderLayer(nnx.Module):
         q = self.q_proj(x).reshape(b, sequence_length, self.config.num_heads, self.config.head_dim)
         k = self.k_proj(x).reshape(b, sequence_length, self.config.num_kv_heads, self.config.head_dim)
         v = self.v_proj(x).reshape(b, sequence_length, self.config.num_kv_heads, self.config.head_dim)
-        positions = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (b, sequence_length))
-        q = _apply_rope(q, positions)
-        k = _apply_rope(k, positions)
         repeats = self.config.num_heads // self.config.num_kv_heads
         k = jnp.repeat(k, repeats, axis=2)
         v = jnp.repeat(v, repeats, axis=2)
         logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32)
         logits *= self.config.head_dim**-0.5
 
-        # A standard causal decoder mask is enough now that there is exactly
-        # one residual query and it is the final token.  The query can inspect
-        # every condition, while no condition can inspect the output query.
-        structural = jnp.tril(jnp.ones((sequence_length, sequence_length), dtype=jnp.bool_))
+        # The conditions are an unordered set, not a sequence, so they attend to
+        # each other in both directions; only the trailing residual queries are
+        # kept out of everyone else's view. A causal mask would give the same
+        # answer for a single layer reading just the final token, but it would
+        # silently starve the conditions of each other once a layer is added.
+        key_positions = jnp.arange(sequence_length)
+        is_condition = key_positions < context_length
+        structural = is_condition[None, :] | (key_positions[:, None] == key_positions[None, :])
         attention_mask = structural[None, None, :, :] & valid_mask[:, None, :, None] & valid_mask[:, None, None, :]
         logits = jnp.where(attention_mask, logits, -2.3819763e38)
         probs = jax.nn.softmax(logits, axis=-1).astype(tokens.dtype)
@@ -236,7 +243,9 @@ class FastForceResidualStudent(nnx.Module):
             nnx.Linear(config.intent_dim, config.width, rngs=rngs) if config.intent_dim != config.width else None
         )
         self.state_proj = nnx.Linear(config.state_dim, config.width, rngs=rngs)
-        self.reference_proj = nnx.Linear(config.reference_dim, config.width, rngs=rngs)
+        self.reference_proj = (
+            nnx.Linear(config.reference_dim, config.width, rngs=rngs) if config.use_reference_token else None
+        )
         self.time_proj = nnx.Linear(config.time_feature_dim, config.width, rngs=rngs)
         self.token_types = nnx.Param(
             nnx.initializers.normal(stddev=0.02)(rngs.params(), (5, config.width), jnp.float32)
@@ -288,14 +297,17 @@ class FastForceResidualStudent(nnx.Module):
         force = self.force_encoder(force_history, force_history_mask, train=train)[:, None, :]
         force = force + self.token_types.value[1]
         state_token = self.state_proj(state)[:, None, :] + self.token_types.value[2]
-        reference = self.reference_proj(reference_action)[:, None, :] + self.token_types.value[3]
         time_token = self.time_proj(time_features)[:, None, :] + self.token_types.value[4]
-        context = jnp.concatenate([intent, force, state_token, reference, time_token], axis=1)
+        parts = [intent, force, state_token]
+        if self.reference_proj is not None:
+            parts.append(self.reference_proj(reference_action)[:, None, :] + self.token_types.value[3])
+        parts.append(time_token)
+        context = jnp.concatenate(parts, axis=1)
         context_mask = jnp.concatenate(
             [
                 intent_mask,
                 jnp.any(force_history_mask, axis=1, keepdims=True),
-                jnp.ones((b, 3), dtype=jnp.bool_),
+                jnp.ones((b, context.shape[1] - intent_length - 1), dtype=jnp.bool_),
             ],
             axis=1,
         )

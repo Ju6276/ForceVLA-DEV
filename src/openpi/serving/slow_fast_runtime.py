@@ -7,6 +7,8 @@ import threading
 
 import numpy as np
 
+from openpi.models.slow_fast import DEFAULT_CONTEXT_AGE_SCALE_S
+
 
 class MissingSlowReferenceError(RuntimeError):
     pass
@@ -27,6 +29,10 @@ class SlowPacket:
     reference_actions: np.ndarray
     action_period_s: float
     version: int
+    # Copied from the Slow cache the Fast student was trained on. Keeping it on the
+    # packet stops the serving loop from silently scaling the time token differently
+    # than training did.
+    context_age_scale_s: float = DEFAULT_CONTEXT_AGE_SCALE_S
 
     def __post_init__(self) -> None:
         intent = np.asarray(self.intent_tokens)
@@ -36,6 +42,8 @@ class SlowPacket:
         timestamps = np.asarray([self.observation_timestamp, self.ready_timestamp, self.reference_start_timestamp])
         if not np.all(np.isfinite(timestamps)) or self.action_period_s <= 0:
             raise ValueError("Slow packet timestamps/action period must be valid")
+        if not np.isfinite(self.context_age_scale_s) or self.context_age_scale_s <= 0:
+            raise ValueError("context_age_scale_s must be positive")
         if self.ready_timestamp < self.observation_timestamp:
             raise ValueError("ready_timestamp cannot precede observation_timestamp")
         if self.version < 0:
@@ -101,10 +109,17 @@ def reference_time_features(
     packet: SlowPacket,
     timestamp: float,
     *,
-    context_age_scale_s: float = 0.25,
+    context_age_scale_s: float | None = None,
 ) -> np.ndarray:
-    """Return normalized [chunk_phase, visual-context age] for the Fast time token."""
-    if context_age_scale_s <= 0:
+    """Return normalized [chunk_phase, visual-context age] for the Fast time token.
+
+    The scale defaults to the one carried by the packet, which comes from the
+    Slow cache the student was trained on. Override it only to probe a
+    different scaling than training used.
+    """
+    if context_age_scale_s is None:
+        context_age_scale_s = packet.context_age_scale_s
+    elif context_age_scale_s <= 0:
         raise ValueError("context_age_scale_s must be positive")
     if timestamp < packet.ready_timestamp:
         raise ValueError("Fast loop cannot consume a Slow packet before it is ready")

@@ -290,6 +290,7 @@ class Pi0(_model.BaseModel):
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Array | None = None,
     ):
         """Sample a force-free nominal chunk and expose its vision-language context."""
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -301,6 +302,7 @@ class Pi0(_model.BaseModel):
             prefix_tokens=prefix_tokens,
             prefix_mask=prefix_mask,
             kv_cache=kv_cache,
+            noise=noise,
         )
         return actions, prefix_context, prefix_mask
 
@@ -322,12 +324,15 @@ class Pi0(_model.BaseModel):
         prefix_tokens,
         prefix_mask,
         kv_cache,
+        noise=None,
     ):
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
-        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        noise = _model.resolve_sample_noise(
+            rng, noise, shape=(batch_size, self.action_horizon, self.action_dim)
+        )
 
         def step(carry):
             x_t, time = carry
