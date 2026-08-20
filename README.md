@@ -266,9 +266,11 @@ Fast TCN 不做 Teacher 的 `1024 → 2048` 输出投影，因为 Fast decoder �
 ```text
 pi_fast(F[t-100ms:t], S_t, Z_intent, A_ref(t), phase/age) → delta_A[:6]
 
-A_cmd[:6] = A_ref[:6] + gate * delta_A
+A_cmd[:6] = A_ref[:6] + delta_A
 A_cmd[6]  = A_ref[6]       # gripper 由 Slow 负责
 ```
+
+正式训练配置 `predict_gate=false`，因此没有学习 gate；代码中的 gate 接口仅作为可选扩展保留，当前值恒为 1。
 
 已实现：
 
