@@ -1,10 +1,13 @@
 """Teacher-guided slow/fast student components.
 
-The Slow student owns a nominal action chunk.  At each fast-loop tick, the
-force-conditioned expert consumes the *current* interpolated reference and
-predicts one pose residual.  It intentionally does not predict another action
-chunk: future residuals would otherwise be conditioned on force/state that have
-not happened yet.
+The Slow student owns a long nominal action chunk.  At each fast-loop tick the
+force-conditioned expert consumes the current interpolated reference and
+predicts a *short* chunk of pose residuals.  Every step of that short chunk is
+conditioned only on force and state up to the tick, which is exactly what the
+Teacher itself saw: the Teacher produced its whole chunk from one observation,
+so `A_full[k] - A_null[k]` means "what the force at time t implies for step k".
+Emitting several steps is what lets the Fast loop tolerate its own inference
+latency and run at a rate that is not fixed at training time.
 """
 
 from __future__ import annotations
@@ -17,19 +20,32 @@ import jax.numpy as jnp
 
 import openpi.models.force_encoder as _force_encoder
 
-# The Fast time token is [chunk phase, context age / DEFAULT_CONTEXT_AGE_SCALE_S]. Offline
-# cache extraction and the online runtime must divide by the same number, otherwise the
-# deployed token lands outside the range the student was trained on.
-DEFAULT_CONTEXT_AGE_SCALE_S = 0.1
+# The Fast time token is [context age / DEFAULT_CONTEXT_AGE_SCALE_S, interpolation alpha].
+# Offline cache extraction and the online runtime must divide by the same number, otherwise
+# the deployed token lands outside the range the student was trained on. The scale has to
+# cover the whole randomized latency+period band below without clipping, since a clipped
+# age makes the student blind to exactly the staleness it is supposed to compensate.
+DEFAULT_CONTEXT_AGE_SCALE_S = 0.6
+# Slow timing is randomized over a band rather than pinned to one operating point, so a
+# single cache covers a range of machines instead of the one it was extracted on.
+DEFAULT_SLOW_LATENCY_RANGE_S = (0.05, 0.30)
+DEFAULT_SLOW_RATE_RANGE_HZ = (5.0, 15.0)
+DEFAULT_UPDATE_JITTER_S = 0.01
+# Fast emits this many consecutive residual steps, spaced by the Teacher's action period.
+DEFAULT_FAST_CHUNK_STEPS = 5
 
 
 @dataclasses.dataclass(frozen=True)
 class FastResidualConfig:
     """Configuration for the lightweight force residual student."""
 
-    reference_dim: int = 7
-    state_dim: int = 7
-    pose_dims: int = 6
+    reference_dim: int = 10
+    state_dim: int = 10
+    pose_dims: int = 9
+    # Number of consecutive residual steps emitted per tick, spaced by the Teacher's
+    # action period. Steps beyond the first are open loop with respect to force, which
+    # is what buys tolerance to Fast's own latency and to an unknown deployment rate.
+    chunk_steps: int = DEFAULT_FAST_CHUNK_STEPS
     time_feature_dim: int = 2
     intent_dim: int = 1024
     width: int = 1024
@@ -60,6 +76,7 @@ class FastResidualConfig:
                 self.reference_dim,
                 self.state_dim,
                 self.pose_dims,
+                self.chunk_steps,
                 self.time_feature_dim,
                 self.intent_dim,
                 self.width,
@@ -143,33 +160,6 @@ class IntentProjector(nnx.Module):
         return self.output_norm(intent)
 
 
-class SlowNominalStudentAdapter(nnx.Module):
-    """Package an independently trained force-free Slow student's outputs.
-
-    Stage-2 paired full/null inference supplies offline targets; it is not the
-    deployed Slow network.  This adapter receives the standalone Slow action
-    chunk and its vision-language context, then creates the cached intent sent
-    to the fast loop.  It never receives force or a learned null-force token.
-    """
-
-    def __init__(
-        self,
-        context_dim: int = 2048,
-        intent_dim: int = 1024,
-        num_intent_tokens: int = 2,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.intent_projector = IntentProjector(context_dim, intent_dim, num_tokens=num_intent_tokens, rngs=rngs)
-
-    def __call__(self, nominal_actions, prefix_context, prefix_mask):
-        if nominal_actions.ndim != 3:
-            raise ValueError(f"Expected nominal action chunk [B,H,D], got {nominal_actions.shape}")
-        if prefix_context.shape[0] != nominal_actions.shape[0]:
-            raise ValueError("Nominal actions and prefix context must have matching batches")
-        return nominal_actions, self.intent_projector(prefix_context, prefix_mask)
-
-
 class GemmaStyleDecoderLayer(nnx.Module):
     """One pre-norm Gemma-style GQA block used by the residual draft head.
 
@@ -234,7 +224,12 @@ class GemmaStyleDecoderLayer(nnx.Module):
 
 
 class FastForceResidualStudent(nnx.Module):
-    """One-block expert that predicts one force-conditioned pose correction."""
+    """One-block expert that predicts a short chunk of force-conditioned pose corrections.
+
+    Only the reference at the current tick is fed in as a token; the later steps of
+    the emitted chunk are located by the Teacher's fixed action period, so the student
+    does not need to see the reference waypoints it is correcting.
+    """
 
     def __init__(self, config: FastResidualConfig, *, rngs: nnx.Rngs):
         self.config = config
@@ -254,7 +249,7 @@ class FastForceResidualStudent(nnx.Module):
             nnx.initializers.normal(stddev=0.02)(rngs.params(), (config.width,), jnp.float32)
         )
         self.decoder = GemmaStyleDecoderLayer(config, rngs=rngs)
-        output_dim = config.pose_dims + int(config.predict_gate)
+        output_dim = config.pose_dims * config.chunk_steps + int(config.predict_gate)
         self.residual_head = nnx.Linear(
             config.width,
             output_dim,
@@ -316,8 +311,9 @@ class FastForceResidualStudent(nnx.Module):
         valid_mask = jnp.concatenate([context_mask, jnp.ones((b, 1), dtype=jnp.bool_)], axis=1)
         hidden = self.decoder(tokens, valid_mask, context_length=context.shape[1], train=train)
         output = self.residual_head(hidden[:, -1]).astype(jnp.float32)
-        residual = output[..., : config.pose_dims]
-        gate = jax.nn.sigmoid(output[..., config.pose_dims]) if config.predict_gate else jnp.ones((b,))
+        span = config.pose_dims * config.chunk_steps
+        residual = output[..., :span].reshape(b, config.chunk_steps, config.pose_dims)
+        gate = jax.nn.sigmoid(output[..., span]) if config.predict_gate else jnp.ones((b,))
         return residual, gate
 
 

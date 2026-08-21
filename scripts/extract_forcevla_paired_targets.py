@@ -19,6 +19,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as model_lib
+from openpi.policies import rotation_6d as rot
 from openpi.shared import nnx_utils
 from openpi.training import config as config_lib
 from openpi.training import data_loader
@@ -101,8 +102,8 @@ def _validate_existing_shard(path: pathlib.Path, start: int, stop: int) -> None:
         missing = required.difference(shard.files)
         if missing:
             raise ValueError(f"Existing shard {path} is missing arrays: {sorted(missing)}")
-        if shard["normalized_pose_residual"].shape[-1] != 6:
-            raise ValueError(f"Existing shard {path} has a non-6D pose residual")
+        if shard["normalized_pose_residual"].shape[-1] != rot.POSE_DIMS:
+            raise ValueError(f"Existing shard {path} has a pose residual that is not {rot.POSE_DIMS}D")
 
 
 def _completed_rows(shard_dir: pathlib.Path, ranges: list[tuple[int, int]]) -> int:
@@ -123,7 +124,7 @@ def _write_manifest(
     manifest = {
         "format_version": FORMAT_VERSION,
         "space": "ForceVLA normalized action space",
-        "residual_definition": "normalized_full_actions[..., :6] - normalized_null_actions[..., :6]",
+        "residual_definition": "normalized_full_actions[..., :9] - normalized_null_actions[..., :9]",
         "config_name": args.config_name,
         "data_config_name": args.data_config_name or args.config_name,
         "checkpoint": str(args.checkpoint.resolve()),
@@ -347,7 +348,7 @@ def main() -> None:
                 dataset_indices=np.arange(batch_start, valid_stop, dtype=np.int64),
                 normalized_full_actions=full,
                 normalized_null_actions=null,
-                normalized_pose_residual=full[..., :6] - null[..., :6],
+                normalized_pose_residual=full[..., : rot.POSE_DIMS] - null[..., : rot.POSE_DIMS],
             )
             for name, value in batch_arrays.items():
                 shard_parts.setdefault(name, []).append(np.asarray(value[:valid_count]))

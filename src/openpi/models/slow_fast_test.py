@@ -10,12 +10,12 @@ from openpi.models import force_encoder
 from openpi.models import slow_fast
 
 
-def test_selected_fast_defaults_use_7d_state_and_100hz_force():
+def test_selected_fast_defaults_use_10d_state_and_100hz_force():
     config = slow_fast.FastResidualConfig()
 
-    assert config.state_dim == 7
-    assert config.reference_dim == 7
-    assert config.pose_dims == 6
+    assert config.state_dim == 10
+    assert config.reference_dim == 10
+    assert config.pose_dims == 9
     assert config.force_encoder.sampling_rate_hz == 100
     assert config.force_encoder.window_ms == 100
     assert config.force_encoder.max_history_samples == 10
@@ -54,7 +54,7 @@ def test_fast_residual_student_shapes_and_zero_safe_initialization():
         jnp.ones((2, 7)),
         jnp.zeros((2, 2)),
     )
-    assert residual.shape == (2, 6)
+    assert residual.shape == (2, _config().chunk_steps, 6)
     assert gate.shape == (2,)
     np.testing.assert_array_equal(residual, 0)
     np.testing.assert_array_equal(gate, 1)
@@ -102,18 +102,6 @@ def test_intent_projector_masks_padding_and_handles_all_padding():
     assert projected.shape == (2, 2, 8)
     assert np.isfinite(projected).all()
     np.testing.assert_array_equal(projected[1], 0)
-
-
-def test_slow_adapter_returns_nominal_chunk_and_compressed_context():
-    adapter = slow_fast.SlowNominalStudentAdapter(context_dim=16, intent_dim=8, num_intent_tokens=2, rngs=nnx.Rngs(2))
-    actions = jnp.ones((2, 4, 7))
-    output_actions, intent = adapter(
-        actions,
-        jnp.ones((2, 5, 16)),
-        jnp.ones((2, 5), dtype=jnp.bool_),
-    )
-    np.testing.assert_array_equal(output_actions, actions)
-    assert intent.shape == (2, 2, 8)
 
 
 def test_fast_config_rejects_width_mismatch():
@@ -169,7 +157,7 @@ def test_stage5_head_projects_slow_context_and_predicts_one_step():
         jnp.ones((2, 7)),
         jnp.zeros((2, 2)),
     )
-    assert residual.shape == (2, 6)
+    assert residual.shape == (2, _config().chunk_steps, 6)
     assert gate.shape == (2,)
     assert intent.shape == (2, 2, 16)
 
@@ -203,4 +191,4 @@ def test_dropping_the_reference_token_removes_its_projection():
         jnp.ones((2, 7)),
         jnp.zeros((2, 2)),
     )
-    assert residual.shape == (2, 6)
+    assert residual.shape == (2, _config().chunk_steps, 6)

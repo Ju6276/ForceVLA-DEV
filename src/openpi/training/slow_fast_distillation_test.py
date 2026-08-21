@@ -9,48 +9,72 @@ from openpi.training import slow_fast_distillation
 class _FakePairedTeacher:
     def sample_paired_actions_and_context(self, rng, observation, *, num_steps):
         del observation, num_steps
-        shared = jax.random.normal(rng, (1, 2, 7))
+        shared = jax.random.normal(rng, (1, 2, 10))
         context = jnp.ones((1, 3, 8))
         mask = jnp.ones((1, 3), dtype=jnp.bool_)
         return shared + 1, shared, context, mask
 
 
 def test_paired_targets_define_pose_residual_and_preserve_nominal():
-    null = jnp.zeros((2, 3, 7))
-    full = null.at[..., :6].set(2)
+    null = jnp.zeros((2, 3, 10))
+    full = null.at[..., :9].set(2)
     targets = slow_fast_distillation.make_paired_teacher_targets(full, null)
     np.testing.assert_array_equal(targets.nominal_actions, null)
     np.testing.assert_array_equal(targets.residual_pose, 2)
 
 
 def test_fast_loss_reconstructs_full_and_ignores_gripper_residual():
-    null = jnp.zeros((1, 2, 7)).at[..., 6].set(0.75)
-    full = null.at[..., :6].set(0.25)
+    null = jnp.zeros((1, 2, 10)).at[..., 9].set(0.75)
+    full = null.at[..., :9].set(0.25)
     targets = slow_fast_distillation.make_paired_teacher_targets(full, null)
-    current = slow_fast_distillation.select_single_step_targets(targets)
+    current = slow_fast_distillation.select_chunk_targets(targets, chunk_steps=2)
     total, metrics = slow_fast_distillation.fast_residual_loss(
         current.residual_pose,
-        null[:, 0],
+        null,
         current,
         slow_fast_distillation.FastDistillationLossConfig(),
     )
     np.testing.assert_allclose(total, 0)
     np.testing.assert_allclose(metrics["reconstruction_loss"], 0)
 
+
+def test_fast_loss_weights_the_executed_step_above_the_lookahead():
+    targets = slow_fast_distillation.select_chunk_targets(
+        slow_fast_distillation.make_paired_teacher_targets(jnp.zeros((1, 2, 10)), jnp.zeros((1, 2, 10))),
+        chunk_steps=2,
+    )
+    config = slow_fast_distillation.FastDistillationLossConfig(reconstruction_weight=0.0, step_decay=0.5)
+    reference = jnp.zeros((1, 2, 10))
+    step0_wrong = jnp.zeros((1, 2, 9)).at[:, 0].set(1.0)
+    step1_wrong = jnp.zeros((1, 2, 9)).at[:, 1].set(1.0)
+    first, _ = slow_fast_distillation.fast_residual_loss(step0_wrong, reference, targets, config)
+    second, _ = slow_fast_distillation.fast_residual_loss(step1_wrong, reference, targets, config)
+    assert float(first) == pytest.approx(2.0 * float(second))
+    # Normalized weights keep the loss scale independent of the chunk length.
+    np.testing.assert_allclose(np.sum(np.asarray(config.step_weights(5))), 1.0, atol=1e-6)
+
+
 def test_paired_targets_require_matching_shapes():
     with pytest.raises(ValueError, match="matched"):
         slow_fast_distillation.make_paired_teacher_targets(jnp.zeros((1, 2, 7)), jnp.zeros((1, 3, 7)))
 
 
-def test_single_step_target_uses_only_timestamp_aligned_chunk_entry():
-    null = jnp.zeros((1, 3, 7))
-    full = null.at[:, 0, :6].set(1).at[:, 1, :6].set(9)
-    current = slow_fast_distillation.select_single_step_targets(
-        slow_fast_distillation.make_paired_teacher_targets(full, null)
+def test_chunk_targets_take_the_leading_teacher_steps():
+    null = jnp.zeros((1, 3, 10))
+    full = null.at[:, 0, :9].set(1).at[:, 1, :9].set(9)
+    current = slow_fast_distillation.select_chunk_targets(
+        slow_fast_distillation.make_paired_teacher_targets(full, null), chunk_steps=2
     )
-    assert current.full_action.shape == (1, 7)
-    assert current.residual_pose.shape == (1, 6)
-    np.testing.assert_array_equal(current.residual_pose, 1)
+    assert current.full_action.shape == (1, 2, 10)
+    assert current.residual_pose.shape == (1, 2, 9)
+    np.testing.assert_array_equal(current.residual_pose[:, 0], 1)
+    np.testing.assert_array_equal(current.residual_pose[:, 1], 9)
+
+
+def test_chunk_targets_cannot_exceed_the_teacher_horizon():
+    targets = slow_fast_distillation.make_paired_teacher_targets(jnp.zeros((1, 3, 10)), jnp.zeros((1, 3, 10)))
+    with pytest.raises(ValueError, match="chunk_steps must be in"):
+        slow_fast_distillation.select_chunk_targets(targets, chunk_steps=4)
 
 
 def test_paired_sampler_returns_one_shared_context_and_force_only_difference():

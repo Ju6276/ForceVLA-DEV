@@ -89,7 +89,7 @@ class Pi0_GuidanceConfig(_model.BaseModelConfig):
     # vector field. The full-force path bypasses it, preserving Stage 1.
     enable_nominal_adapter: bool = False
     nominal_adapter_rank: int = 32
-    nominal_adapter_pose_dims: int = 6
+    nominal_adapter_pose_dims: int = 9
 
     def __post_init__(self):
         if self.force_condition == "null" and not self.enable_null_force_token:
@@ -309,7 +309,7 @@ class Pi0_Guidance(_model.BaseModel):
         tokens = []
         # obs.state is shape [b, 13] (13 = 7 prio + 6 force, ee pose: xyz+rpy, gripper)
         observations = jnp.zeros_like(obs.state)
-        observations = observations.at[:, :7].set(obs.state[:, :7]) ## robot state, xyz + rpy + gripper
+        observations = observations.at[:, :10].set(obs.state[:, :10])  # xyz + 6D + gripper
         state_token = self.state_proj(observations)[:, None, :] # [b, 1, d]
         # state_token = self.state_proj(obs.state)[:, None, :] # [b, 1, d]
         tokens.append(state_token)
@@ -352,7 +352,7 @@ class Pi0_Guidance(_model.BaseModel):
         encoder_type = self.force_encoder_config.type
         if encoder_type == "instantaneous":
             # Preserve the original parameter name and exact computation.
-            return self.force_in_proj(obs.state[:, 7:13])
+            return self.force_in_proj(obs.state[:, 10:16])
         if obs.force_history is None or obs.force_history_mask is None:
             raise ValueError(f"force_history and force_history_mask are required for {encoder_type!r} mode")
         assert self.temporal_force_encoder is not None

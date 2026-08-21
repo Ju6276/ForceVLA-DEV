@@ -9,6 +9,7 @@ much larger number of free-space samples.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import pathlib
 
@@ -18,29 +19,22 @@ import numpy as np
 
 from openpi.models import model as model_lib
 from openpi.models import slow_fast
+from openpi.policies import rotation_6d as rot
 from openpi.shared import normalize as normalize_lib
 from openpi.training import fast_dataset
 
 TRANSLATION_DIMS = slice(0, 3)
-ROTATION_DIMS = slice(3, 6)
-POSE_DIM_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
+ROTATION_6D_DIMS = slice(3, 9)
+POSE_DIM_NAMES = ("x", "y", "z", "r6d_0", "r6d_1", "r6d_2", "r6d_3", "r6d_4", "r6d_5")
 
 
 def _pose_difference(prediction: np.ndarray, target: np.ndarray, *, physical: bool) -> np.ndarray:
-    """Subtract two poses, wrapping rotation dimensions into (-pi, pi].
-
-    A few episodes record roll near -2*pi instead of 0, so a plain subtraction
-    would report a full revolution as a huge error.
-    """
-    error = np.asarray(prediction, dtype=np.float64) - np.asarray(target, dtype=np.float64)
-    if physical:
-        rotation = error[:, ROTATION_DIMS]
-        error[:, ROTATION_DIMS] = (rotation + np.pi) % (2 * np.pi) - np.pi
-    return error
+    del physical
+    return np.asarray(prediction, dtype=np.float64) - np.asarray(target, dtype=np.float64)
 
 
-def _load_model(checkpoint: pathlib.Path):
-    config = slow_fast.FastResidualConfig()
+def _load_model(checkpoint: pathlib.Path, *, chunk_steps: int):
+    config = slow_fast.FastResidualConfig(chunk_steps=chunk_steps)
     model = slow_fast.FastStudentWithIntentProjector(config, slow_context_dim=2048, rngs=nnx.Rngs(0))
     params = model_lib.restore_params(checkpoint)
     state = nnx.state(model, nnx.Param)
@@ -77,7 +71,7 @@ def _predict_all(model, arrays, cache, *, batch_size: int, seed: int) -> dict[st
         force_mask = jnp.asarray(arrays.force_history_mask[indices], dtype=jnp.bool_)
         suffix = (
             jnp.asarray(arrays.state[indices], dtype=jnp.float32),
-            jnp.asarray(cache.reference_actions[indices], dtype=jnp.float32),
+            jnp.asarray(cache.reference_actions[indices, 0], dtype=jnp.float32),
             jnp.asarray(cache.time_features[indices], dtype=jnp.float32),
         )
         predictions["full"].append(np.asarray(infer(model, *common, force, force_mask, *suffix)))
@@ -99,10 +93,18 @@ def _predict_all(model, arrays, cache, *, batch_size: int, seed: int) -> dict[st
 
 def _pose_error_summary(prediction: np.ndarray, target: np.ndarray, *, physical: bool) -> dict:
     error = _pose_difference(prediction, target, physical=physical)
+    if physical and prediction.shape[-1] >= rot.POSE_DIMS:
+        geodesic = rot.geodesic_angle(
+            rot.sixd_to_matrix(np.asarray(prediction)[:, ROTATION_6D_DIMS]),
+            rot.sixd_to_matrix(np.asarray(target)[:, ROTATION_6D_DIMS]),
+        )
+        rotation_rmse = float(np.sqrt(np.mean(np.square(geodesic))))
+    else:
+        rotation_rmse = float(np.sqrt(np.mean(np.sum(np.square(error[:, ROTATION_6D_DIMS]), axis=-1))))
     return {
         "mse": float(np.mean(np.square(error))),
         "translation_rmse": float(np.sqrt(np.mean(np.sum(np.square(error[:, TRANSLATION_DIMS]), axis=-1)))),
-        "rotation_rmse": float(np.sqrt(np.mean(np.sum(np.square(error[:, ROTATION_DIMS]), axis=-1)))),
+        "rotation_rmse": rotation_rmse,
         "per_dim_rmse": {
             name: float(np.sqrt(np.mean(np.square(error[:, index])))) for index, name in enumerate(POSE_DIM_NAMES)
         },
@@ -178,6 +180,9 @@ def _stratum_metrics(
 
 def _print_report(metrics: dict) -> None:
     print("\n=== Fast residual evaluation ===")
+    per_step = metrics["per_step_residual_mse_normalized"]["full"]
+    print(f"  emitted chunk steps={metrics['chunk_steps']}")
+    print("  per-step residual mse (normalized): " + "  ".join(f"k{k}={v:.6f}" for k, v in enumerate(per_step)))
     for stratum, values in metrics["strata"].items():
         print(f"\n[{stratum}]  rows={values['rows']}")
         physical = metrics["units"] == "physical"
@@ -237,18 +242,46 @@ def main() -> None:
     if args.contact_threshold_n <= 0:
         raise ValueError("contact-threshold-n must be positive")
 
-    arrays = fast_dataset.load_stage3_fast_arrays(args.targets)
-    cache = fast_dataset.load_slow_cache(args.slow_cache, expected_rows=len(arrays.dataset_indices))
-    model = _load_model(args.checkpoint.resolve())
-    predictions = _predict_all(model, arrays, cache, batch_size=args.batch_size, seed=args.seed)
+    cache = fast_dataset.load_slow_cache(args.slow_cache)
+    arrays = fast_dataset.load_stage3_fast_arrays(args.targets, chunk_steps=cache.chunk_steps)
+    if len(cache.row_key_positions) != len(arrays.dataset_indices):
+        raise ValueError(
+            f"Slow cache covers {len(cache.row_key_positions)} rows but Stage-3 has {len(arrays.dataset_indices)}"
+        )
+    ready = np.flatnonzero(cache.row_ready) if cache.row_ready is not None else np.arange(len(arrays.dataset_indices))
+    if len(ready) == 0:
+        raise ValueError("Slow cache has no rows whose packet would already be ready")
+    arrays = dataclasses.replace(
+        arrays,
+        **{
+            field.name: getattr(arrays, field.name)[ready]
+            for field in dataclasses.fields(arrays)
+        },
+    )
+    cache = dataclasses.replace(
+        cache,
+        reference_actions=cache.reference_actions[ready],
+        time_features=cache.time_features[ready],
+        row_key_positions=cache.row_key_positions[ready],
+        row_ready=np.ones(len(ready), dtype=bool) if cache.row_ready is not None else None,
+    )
+    model = _load_model(args.checkpoint.resolve(), chunk_steps=cache.chunk_steps)
+    chunk_predictions = _predict_all(model, arrays, cache, batch_size=args.batch_size, seed=args.seed)
+    # Every step of the emitted chunk is scored, but the detailed pose report is on
+    # step 0: that is the one that executes whenever Fast keeps up with the action rate.
+    per_step_residual_mse = {
+        name: [float(np.mean(np.square(value[:, step] - arrays.residual_pose[:, step]))) for step in range(cache.chunk_steps)]
+        for name, value in chunk_predictions.items()
+    }
+    predictions = {name: value[:, 0] for name, value in chunk_predictions.items()}
 
     poses = {
-        "reference": cache.reference_actions[:, :6].astype(np.float32),
-        "teacher_full": arrays.full_pose,
-        "teacher_null": arrays.null_pose,
-        "expert": arrays.expert_pose,
+        "reference": cache.reference_actions[:, 0, : rot.POSE_DIMS].astype(np.float32),
+        "teacher_full": arrays.full_pose[:, 0],
+        "teacher_null": arrays.null_pose[:, 0],
+        "expert": arrays.expert_pose[:, 0],
     }
-    residual_target = arrays.residual_pose
+    residual_target = arrays.residual_pose[:, 0]
     units = "normalized"
     contact_summary: dict = {"available": False}
     strata: dict[str, np.ndarray] = {}
@@ -261,8 +294,8 @@ def main() -> None:
         # Reporting in metres and radians is what makes the numbers actionable;
         # normalized MSE cannot tell whether an error is safe on hardware.
         action_stats = norm_stats["actions"]
-        poses = {name: fast_dataset.denormalize(value, action_stats, dims=6) for name, value in poses.items()}
-        scale = (np.asarray(action_stats.std, dtype=np.float64)[:6] + 1e-6).astype(np.float32)
+        poses = {name: fast_dataset.denormalize(value, action_stats, dims=rot.POSE_DIMS) for name, value in poses.items()}
+        scale = (np.asarray(action_stats.std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(np.float32)
         predictions = {name: value * scale for name, value in predictions.items()}
         residual_target = residual_target * scale
         units = "physical"
@@ -299,6 +332,8 @@ def main() -> None:
     metrics = {
         "rows": len(residual_target),
         "units": units,
+        "chunk_steps": cache.chunk_steps,
+        "per_step_residual_mse_normalized": per_step_residual_mse,
         "norm_stats_dir": str(args.norm_stats_dir) if norm_stats is not None else None,
         "contact": contact_summary,
         "strata": {

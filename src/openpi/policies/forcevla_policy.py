@@ -5,12 +5,13 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.policies import rotation_6d as _rotation_6d
 
 
 def make_forcevla_example() -> dict:
     """Creates a random input example compatible with Flexiv config."""
     return {
-        "state": np.ones((14,)),  # observation.state, 7 ee pose, 1 gripper, 6 force
+        "state": np.ones((13,)),  # observation.state, xyz+rpy+gripper+force before 6D rewrite
         "image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
         "wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
         "prompt": "do something",
@@ -42,9 +43,9 @@ class Forcevla_inputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
     use_force_history: bool = False
     force_history_from_state: bool = False
-    # Restrict the state pathway to robot proprioception for a force-free
-    # student. For example, 7 keeps xyz, rpy, and gripper while replacing the
-    # wrench dimensions with padding that is independent of force.
+        # Restrict the state pathway to robot proprioception for a force-free
+        # student. For example, 10 keeps xyz, 6D rotation, and gripper while replacing
+        # the wrench dimensions with padding that is independent of force.
     robot_state_dims: int | None = None
 
     def __call__(self, data: dict) -> dict:
@@ -57,7 +58,8 @@ class Forcevla_inputs(transforms.DataTransformFn):
         # Keep this for your own dataset, but if your dataset stores the proprioceptive input
         # in a different key than "observation/state", you should change it below.
         raw_state = np.asarray(data["state"])
-        current_state = raw_state[-1] if self.force_history_from_state else raw_state
+        current_raw = raw_state[-1] if self.force_history_from_state else raw_state
+        current_state = _rotation_6d.convert_state(current_raw)
         if self.robot_state_dims is not None:
             if self.robot_state_dims <= 0 or self.robot_state_dims > current_state.shape[-1]:
                 raise ValueError(
@@ -118,9 +120,7 @@ class Forcevla_inputs(transforms.DataTransformFn):
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.
         if "actions" in data:
-            # We are padding to the model action dim.
-            # For pi0-FAST, this is a no-op (since action_dim = 7).
-            actions = transforms.pad_to_dim(data["actions"], self.action_dim)
+            actions = transforms.pad_to_dim(_rotation_6d.convert_action(np.asarray(data["actions"])), self.action_dim)
             inputs["actions"] = actions
 
         # Pass the prompt (aka language instruction) to the model.
@@ -141,6 +141,6 @@ class Forcevla_outputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first N actions -- since we padded actions above to fit the model action
         # dimension, we need to now parse out the correct number of actions in the return dict.
-        # For forcevla, we only return the first 7 actions (since the rest is padding), xyz  + RPY + gripper
-        # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        # The model acts in xyz+6D+gripper; the robot still consumes xyz+rpy+gripper.
+        converted = np.asarray(data["actions"])[:, : _rotation_6d.ROBOT_DIMS]
+        return {"actions": _rotation_6d.actions_6d_to_rpy(converted)}

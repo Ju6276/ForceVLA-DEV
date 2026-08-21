@@ -25,6 +25,7 @@ from typing import Callable
 import numpy as np
 
 from openpi import transforms
+from openpi.policies import rotation_6d as rot
 from openpi.serving import slow_fast_runtime
 
 
@@ -78,9 +79,13 @@ class SlowFastConfig:
     """Timing and safety limits for the composed controller."""
 
     action_period_s: float
-    pose_dims: int = 6
-    # ForceVLA makes xyz and rpy relative to the state; the gripper stays absolute.
-    delta_dims: int = 6
+    pose_dims: int = 9
+    # ForceVLA makes xyz and 6D rotation relative to the state; the gripper stays absolute.
+    delta_dims: int = 9
+    # Length of the chunk Fast emits per tick. The caller may execute only the first
+    # entry and tick again, or walk further into the chunk when Fast falls behind, so
+    # the Fast call rate does not have to be fixed at training time.
+    chunk_steps: int = 5
     max_staleness_s: float = 0.25
     # Per-dimension cap on the Fast correction, in normalized action units. Leaving
     # this unset lets an unbounded residual reach the arm.
@@ -89,6 +94,8 @@ class SlowFastConfig:
     def __post_init__(self) -> None:
         if self.action_period_s <= 0 or self.max_staleness_s < 0:
             raise ValueError("action_period_s must be positive and max_staleness_s non-negative")
+        if self.chunk_steps <= 0:
+            raise ValueError("chunk_steps must be positive")
         if not 0 < self.delta_dims <= self.pose_dims:
             raise ValueError("delta_dims must be positive and at most pose_dims")
 
@@ -183,7 +190,12 @@ class SlowFastController:
         self._config = config
 
     def step(self, timestamp: float, state) -> dict:
-        """Produce one absolute command, in physical units, for the given instant.
+        """Produce a short chunk of absolute commands, in physical units, from one tick.
+
+        `command[k]` is meant for `timestamp + k * action_period_s`. Executing only
+        `command[0]` and ticking again is the nominal case; the later entries are what
+        the caller falls back on when Fast cannot be called at the action rate, which
+        is what keeps the loop from depending on a rate fixed at training time.
 
         Raises `MissingSlowReferenceError` before the first packet arrives and
         `StaleSlowReferenceError` once the current chunk has run out; the caller is
@@ -191,8 +203,12 @@ class SlowFastController:
         """
         packet = self._cache.snapshot()
         config = self._config
+        if packet.intent_mask is None:
+            # Pooling leaves empty context bins invalid, so substituting an
+            # all-valid mask would feed the student padding as if it were context.
+            raise ValueError("The Slow packet carries no intent mask; the Fast student requires one")
         reference = slow_fast_runtime.sample_reference(
-            packet, timestamp, max_staleness_s=config.max_staleness_s
+            packet, timestamp, steps=config.chunk_steps, max_staleness_s=config.max_staleness_s
         )
         time_features = slow_fast_runtime.reference_time_features(packet, timestamp)
         force_history, force_mask = self._force_buffer.window(timestamp)
@@ -202,7 +218,7 @@ class SlowFastController:
             force_history=force_history,
             force_history_mask=force_mask,
             state=np.asarray(self._normalize_state(np.asarray(state, dtype=np.float32)), dtype=np.float32),
-            reference_action=reference,
+            reference_action=reference[0],
             time_features=time_features,
         )
         composed = slow_fast_runtime.compose_reference_residual(
@@ -215,8 +231,11 @@ class SlowFastController:
         command = slow_fast_runtime.to_absolute_command(
             composed, packet, self._unnormalize_action, delta_dims=config.delta_dims
         )
+        if command.shape[-1] >= rot.ROBOT_DIMS:
+            command = rot.actions_6d_to_rpy(command)
         return {
             "command": command,
+            "command_period_s": config.action_period_s,
             "reference_normalized": reference,
             "residual_normalized": np.asarray(residual, dtype=np.float32),
             "gate": float(gate),

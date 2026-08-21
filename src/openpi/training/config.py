@@ -36,6 +36,10 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
+# Indices into the force-rate-filtered dataset built by
+# `scripts/filter_dataset_by_force_rate.py --min-force-rate-hz 100`. That filter
+# keeps exactly the 66 episodes these two splits already used, so the physical
+# episodes are unchanged from the 100-episode recording; only the numbering is.
 _BUTTON_PRESS_TRAIN_EPISODES = (
     0,
     3,
@@ -52,49 +56,49 @@ _BUTTON_PRESS_TRAIN_EPISODES = (
     14,
     15,
     16,
+    18,
+    19,
     21,
+    22,
+    23,
     24,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
     43,
     44,
     45,
-    46,
+    47,
     48,
-    49,
     50,
-    51,
     52,
     53,
-    54,
     55,
     56,
     57,
     58,
     59,
     60,
-    61,
     62,
     63,
     64,
     65,
-    66,
-    67,
-    69,
-    70,
-    72,
-    74,
-    75,
-    77,
-    78,
-    79,
-    80,
-    82,
-    83,
-    85,
-    87,
-    89,
-    90,
 )
-_BUTTON_PRESS_VAL_EPISODES = (1, 2, 20, 42, 47, 68, 71, 73, 76, 84)
+_BUTTON_PRESS_VAL_EPISODES = (1, 2, 17, 20, 25, 46, 49, 51, 54, 61)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -501,7 +505,8 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
     observation_timestamp_key: str = "timestamp"
     native_force_sidecar: NativeForceSidecarConfig | None = None
     # If set, expose only the first N robot-state dimensions to the model and
-    # replace the rest with force-independent padding. Stage-4 Slow uses 7.
+    # replace the rest with force-independent padding. After the 6D rewrite this
+    # is 10 (xyz + 6D rotation + gripper) rather than 7.
     robot_state_dims: int | None = None
 
     @override
@@ -578,8 +583,9 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
 
         # TODO(karl): comment this out once we have updated the Libero checkpoints to not use
         # the delta action transform
-        ## action: xyz  + rpy + gripper
-        delta_action_mask = _transforms.make_bool_mask(6, -1)
+        ## action: xyz + 6D rotation + gripper. 6D is continuous, so the usual
+        ## componentwise delta is safe; the gripper stays absolute.
+        delta_action_mask = _transforms.make_bool_mask(9, -1)
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -1126,81 +1132,6 @@ _CONFIGS = [
         batch_size=4,
     ),
     TrainConfig(
-        name="forcevla_button_slow_lora",
-        project_name="forcevla",
-        # Stage 4 is intentionally a standard force-free pi0. It inherits all
-        # compatible Stage-2 weights, then distills the Teacher's null actions.
-        model=pi0.Pi0Config(
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotForcevlaDataConfig(
-            repo_id="panda_button_press",
-            assets=AssetsConfig(
-                assets_dir="./assets/forcevla_button_temporal_100hz",
-                asset_id="panda_button_press_temporal_100hz_train56",
-            ),
-            robot_state_dims=7,
-            base_config=DataConfig(
-                episodes=_BUTTON_PRESS_TRAIN_EPISODES,
-                prompt_from_task=True,
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_null_bc/9999/params",
-            missing_regex=r"a^",
-        ),
-        offline_action_target_dir="./artifacts/button_stage3_paired_targets/train",
-        offline_action_target_key="normalized_null_actions",
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
-            peak_lr=2.5e-5,
-            decay_steps=10_000,
-            decay_lr=2.5e-6,
-        ),
-        num_train_steps=10_000,
-        save_interval=5_000,
-        keep_period=5_000,
-        freeze_filter=pi0.Pi0Config(
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        batch_size=4,
-        num_workers=2,
-    ),
-    TrainConfig(
-        name="forcevla_button_slow_lora_val",
-        project_name="forcevla",
-        # Evaluation/cache-extraction companion for the standalone force-free
-        # Slow student.  It deliberately shares the train normalization stats.
-        model=pi0.Pi0Config(
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotForcevlaDataConfig(
-            repo_id="panda_button_press",
-            assets=AssetsConfig(
-                assets_dir="./assets/forcevla_button_temporal_100hz",
-                asset_id="panda_button_press_temporal_100hz_train56",
-            ),
-            robot_state_dims=7,
-            base_config=DataConfig(
-                episodes=_BUTTON_PRESS_VAL_EPISODES,
-                prompt_from_task=True,
-            ),
-        ),
-        weight_loader=weight_loaders.NoOpWeightLoader(),
-        num_train_steps=0,
-        freeze_filter=pi0.Pi0Config(
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        batch_size=4,
-        num_workers=0,
-    ),
-    TrainConfig(
         name="forcevla_button_temporal_stage2_null_bc",
         project_name="forcevla",
         model=pi0_force.Pi0_GuidanceConfig(
@@ -1217,7 +1148,7 @@ _CONFIGS = [
             force_condition="null",
             enable_nominal_adapter=True,
             nominal_adapter_rank=32,
-            nominal_adapter_pose_dims=6,
+            nominal_adapter_pose_dims=9,
         ),
         data=LeRobotForcevlaDataConfig(
             repo_id="panda_button_press",

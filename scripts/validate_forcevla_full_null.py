@@ -17,6 +17,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as model_lib
+from openpi.policies import rotation_6d as rot
 from openpi.shared import nnx_utils
 from openpi.training import config as config_lib
 from openpi.training import data_loader
@@ -312,7 +313,11 @@ def main() -> None:
         "normalized_expert_actions": normalized_expert_array,
         "normalized_full_actions": predictions["full"],
         "normalized_null_actions": predictions["null"],
-        "normalized_pose_residual": predictions["full"][..., :6] - predictions["null"][..., :6],
+        # Normalized model space is xyz+6D+gripper, unlike the physical arrays above
+        # which the output transform has already turned back into xyz+rpy+gripper.
+        "normalized_pose_residual": (
+            predictions["full"][..., : rot.POSE_DIMS] - predictions["null"][..., : rot.POSE_DIMS]
+        ),
     }
     if normalized_force_history:
         saved_arrays["normalized_force_history"] = np.concatenate(normalized_force_history)
