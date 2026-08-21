@@ -62,29 +62,17 @@ data/panda_button_press_100hz_causal/raw_sidecars/episode_000000.npz
 时会尝试联网下载并失败，所以要软链到本地副本：
 
 ```bash
-export BUTTON_RAW=<原始 100-episode 数据集路径>
-export BUTTON_DATA=<筛选后数据集的目标路径>
-
-ln -sfn "$BUTTON_DATA" ~/.cache/huggingface/lerobot/panda_button_press
+ln -sfn <数据集路径> ~/.cache/huggingface/lerobot/panda_button_press
 ```
 
-### 力采样率过滤
+Button 数据集是 66 个 episode、37104 帧，编号 0–65 连续，力采样率全部 ≥100 Hz。`config.py` 里
+`_BUTTON_PRESS_TRAIN_EPISODES`（56 条）和 `_BUTTON_PRESS_VAL_EPISODES`（10 条）的索引就是按这个编号写
+死的，两个 split 在力采样率和按钮位置上都匹配（均值 196 Hz vs 196 Hz）。
 
-原始 100 episode 的力速率在 57–314 Hz 之间。`scripts/filter_dataset_by_force_rate.py` 按整段平均速率
-（`(n-1)/(t_last-t_first)`，而非中位间隔——中位数在丢包的流上仍然很高）筛选，并重建连续的 episode 编号
-和 dataset 级 frame index。加 `--dry-run` 只看选中结果不落盘：
-
-```bash
-python scripts/filter_dataset_by_force_rate.py \
-    --dataset  "$BUTTON_RAW" \
-    --sidecars data/panda_button_press_100hz_causal/raw_sidecars_unfiltered_100ep \
-    --output   "$BUTTON_DATA" \
-    --sidecar-output data/panda_button_press_100hz_causal/raw_sidecars \
-    --min-force-rate-hz 100
-```
-
-100 Hz 阈值保留 66 条、37104 帧，`config.py` 里两个 split 的索引按新编号写死。换阈值重跑过滤就必须同步
-重映射这两串索引，否则 train/val 会静默错位。
+要换力采样率门槛就用 `scripts/filter_dataset_by_force_rate.py`（`--dry-run` 只看选中结果）。它按整段平均
+速率 `(n-1)/(t_last-t_first)` 筛选，而不是中位间隔——中位数在丢包的流上仍然虚高。它会重排 episode 编号和
+dataset 级 frame index，所以**必须同步重映射上面那两串索引**，否则 train/val 会静默错位；也不要按位置切
+（取末尾若干条），因为采集场次不同，尾部的力率和按钮位置都有系统偏移。
 
 ## Button 完整重跑流程
 
@@ -140,8 +128,8 @@ python scripts/extract_forcevla_paired_targets.py \
 ```
 
 **先看这一步的 summary 再往下走。** `full_vs_expert` 与 `null_vs_expert` 的相对差就是力条件带来的全部
-收益，也是 Fast 的信号上限。旧 Euler 数字只有 4.9% / 6.9%；如果 6D 重跑后仍然这么小，后面的收益空间
-同样有限。
+收益，也是 Fast 的信号上限。这个差只有个位数百分比的话，后面 Stage 4 能拿到的收益同样有限，值得先停下
+来查为什么力条件没起作用。
 
 ### 5. Slow cache
 
@@ -208,18 +196,19 @@ context/state/reference 猜 residual。省略 `--norm-stats-dir` 退化为 norma
 
 - `deployment_error_decomposition`：`(A_ref + delta) - A_full = (A_ref - A_null) + (delta - (A_full - A_null))`
   精确拆成一个与力无关的 Slow 项和唯一被训练的 Fast 项。两项都含 `A_null`，**不能相加**，只比量级。
-  旧 Euler run 里 Slow 误差比整个力修正信号还大 2.4 倍，组合改善因此被分母锁死。
+  如果 Slow 项比整个力修正信号还大，组合改善就会被分母锁死，此时该去降 Slow 误差而不是调 Fast。
 - `per_step_residual_mse_normalized`：chunk 后几步是否也学到了。
-- 分平移 / 测地线旋转的物理误差。**旋转是否终于被学到，是 6D 改造是否奏效的判据**——旧 Euler run 里
-  所有模型的旋转误差几乎一样，等于没学。
+- 分平移 / 测地线旋转的物理误差。各模型的旋转误差是否拉开差距，是 6D 改造是否奏效的判据。
 
 ## 设计要点
 
 ### 6D 连续旋转
 
 数据集用欧拉角记录末端姿态，而 Button Press 静止在 roll ≈ ±π，正好是分支切点：同一物理姿态被随机记成
-`+3.1416` 或 `-3.1416`。后果是 `DeltaActions` 逐维相减会产生 ±2π 的假 delta，且 roll 的 std 被虚高 187
-倍——z-score 之后真实变化被压到 1/187，Teacher/Slow/Fast 三级都几乎没学过 roll。
+`+3.1416` 或 `-3.1416`。后果是 `DeltaActions` 逐维相减产生 ±2π 的假 delta——train 集实测 **5.37% 的样本**
+如此，roll 的 delta std 因而是 1.451（pitch/yaw 只有 0.013 量级，即虚高约 108 倍）。z-score 之后 roll 的
+真实变化被压到百分之一量级，Teacher/Slow/Fast 三级都几乎没学过它。改成 6D 后最大 |delta| 从 6.28 降到
+0.058，2π 跳变消失。
 
 `forcevla_policy.py` 现在把 xyz+rpy 改写成 xyz+6D（Zhou et al.，旋转矩阵前两列），模型输入 16D state /
 10D action，输出再转回 rpy 给机器人。磁盘上的 parquet 仍是欧拉角，公共 `transforms.DeltaActions` 不打
