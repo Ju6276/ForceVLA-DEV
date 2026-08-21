@@ -355,6 +355,9 @@ try:
     send_robot_command(command_cache.sample(time.monotonic())["command"])
 except (slow_fast_loop.MissingFastCommandError, slow_fast_loop.StaleFastCommandError):
     hold_or_abort_safely()
+    # Fast 后台线程若已因致命错误退出，只有这里能拿到原因；不查就只能看到
+    # chunk 一直过期，看不出是推理挂了还是 Slow 没跟上。
+    fast_worker.raise_if_failed()
 ```
 
 `normalize_force_history` 是必填参数，没有默认值：Fast 是在归一化后的力上训的，直接喂原始牛顿值在偏置和
