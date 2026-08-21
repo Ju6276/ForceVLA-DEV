@@ -268,9 +268,11 @@ A_cmd[k, 9]  = A_ref(t + k·action_period)[9]      # gripper 由 Slow 独占
 **两个时间特征必须互不共线。** 旧的 `[phase, age]` 是同一个 age 除以两个常数，实测相关系数 1.0，等于
 只有一维。现在是 `[age/scale, alpha]`，alpha 是两个 Teacher waypoint 之间的插值位置。
 
-**Fast 不接图像。** `sample_paired_actions_and_context` 里 full 和 null 共用同一份 `prefix_out_fix` 和
-同一个 flow noise，所以 `A_full − A_null` 里视觉的贡献精确抵消，标签是力条件的纯函数。喂新鲜图像无法
-降低这个目标的损失。要让 Fast 应对 Slow 更新之间的场景变化，得改目标定义，不是加输入。
+**Fast 不接新图像。** `sample_paired_actions_and_context` 里 full 和 null 共用同一份 `prefix_out_fix` 和
+同一个 flow noise，因此差分没有视觉输入或采样噪声不匹配；但
+`A_full − A_null` 仍是以视觉语言上下文、state 和任务为条件的 Teacher force-induced deviation，不是只依赖
+force 的纯函数。Fast 通过缓存的 Slow context 接收这部分条件。如果要响应两次 Slow 更新之间出现的新视觉
+变化，才需要改变目标和输入定义。
 
 主实验只优化 `MSE(delta_A_fast, A_full - A_null)`；`--reconstruction-weight` 默认 0，避免 Fast 去学与力
 无关的 Slow 预测/插值误差。`predict_gate=false`，gate 接口保留但恒为 1。
@@ -299,6 +301,8 @@ cache 存在的唯一理由，是让 Fast 训练时看到的 packet 结构和运
 必须先转成 6D、state 与 force history 都要按训练 norm stats 归一化。
 
 ```python
+import time
+
 from openpi.serving import slow_fast_deploy, slow_fast_loop, slow_fast_runtime
 
 contract = slow_fast_deploy.load_contract(
@@ -309,16 +313,17 @@ build_packet = slow_fast_deploy.SlowPacketBuilder(contract)
 # state 和 force history 都归一化；力传感器的原始牛顿值不能直接喂 Fast。
 normalizers = slow_fast_deploy.load_normalizers(data_config.norm_stats)
 
-def observe():
-    timestamp, raw_state, images = read_robot()
-    return timestamp, images, slow_fast_deploy.convert_robot_state(raw_state)
+def observe_slow():
+    timestamp, raw_state, teacher_observation = read_robot()
+    # timestamp 必须和 time.monotonic() 使用同一个时钟域。
+    return timestamp, teacher_observation, slow_fast_deploy.convert_robot_state(raw_state)
 
 def infer(observation):
     return build_packet(*teacher.sample_nominal_actions_and_context(rng, observation))
 
 cache = slow_fast_runtime.SlowReferenceCache()
 worker = slow_fast_loop.SlowWorker(
-    observe=observe, infer=infer, cache=cache,
+    observe=observe_slow, infer=infer, cache=cache,
     config=contract.slow_fast_config(residual_limit=0.02),
     context_age_scale_s=contract.context_age_scale_s, period_s=0.1,
 )
@@ -328,11 +333,34 @@ controller = slow_fast_loop.SlowFastController(
     config=contract.slow_fast_config(residual_limit=0.02),
     **{key: normalizers[key] for key in ("normalize_state", "normalize_force_history")},
 )
+
+# Fast inference 和 actuator 不在同一线程。Fast 完成时发布整个短 chunk；
+# actuator 按当前 timestamp 自动跳过推理期间已经过期的前几步。
+command_cache = slow_fast_loop.FastCommandCache()
+
+def observe_fast():
+    timestamp, raw_state = read_latest_robot_state()
+    return timestamp, slow_fast_deploy.convert_robot_state(raw_state)
+
+fast_worker = slow_fast_loop.FastWorker(
+    observe=observe_fast, controller=controller, command_cache=command_cache,
+    period_s=0.02,  # 请求频率；真实完成频率仍由 Fast inference latency 决定
+)
+
+worker.start()
+fast_worker.start()
+
+# 独立的 actuator tick：sample() 根据 timestamp 选择 k，而不是永远执行 k=0。
+try:
+    send_robot_command(command_cache.sample(time.monotonic())["command"])
+except (slow_fast_loop.MissingFastCommandError, slow_fast_loop.StaleFastCommandError):
+    hold_or_abort_safely()
 ```
 
 `normalize_force_history` 是必填参数，没有默认值：Fast 是在归一化后的力上训的，直接喂原始牛顿值在偏置和
-量级上都错，但不会触发任何形状检查。归一化要作用在整个零填充窗口上、**不要**再乘 mask——训练侧是先填 0
-再归一化，所以无效 slot 到达模型时的值是 `-mean/std` 而不是 0。
+量级上都错，但不会触发任何形状检查。归一化作用于整个零填充窗口；随后 TCN 和训练时一样用 mask 将无效
+slot 清零。`controller.step()` 的 state 则严格要求已经通过 `convert_robot_state()` 转为10D，原始7D state
+会在模型调用前直接报错。
 
 形状从 cache 的 summary 读，**时序带必须从 Fast 训练 run 的 `metadata.json` 读**——推荐的 train cache 是
 全速率提取的，它自己记录的带是退化的 `[0, 0]`。上机前用
@@ -352,6 +380,10 @@ controller = slow_fast_loop.SlowFastController(
 | `forcevla_button_temporal_100hz` | Button Stage 1，100 Hz 力 |
 | `forcevla_button_temporal_100hz_val` | Button held-out loader |
 | `forcevla_button_temporal_stage2_null_bc` | Button Stage 2 |
+
+TODO（暂不实现）：增加与 Button temporal 完全相同数据划分、6D pose 表示和训练 schedule 的 Button
+instantaneous 配置，用于受控 Stage-1 对比。用户确认开始该实验时再添加，当前不阻塞 temporal/slow-fast
+流程。
 
 `forcevla_lora` / `forcevla_usb_lora` 始终是 instantaneous baseline，训练 temporal 模型必须显式选 temporal
 config。这些 LoRA config 沿用 OpenPI/ForceVLA 的 freeze filter：Gemma 主权重冻结，LoRA 参数、视觉编码器

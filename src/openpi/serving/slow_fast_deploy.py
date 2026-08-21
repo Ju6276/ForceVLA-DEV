@@ -46,6 +46,7 @@ class DeploymentContract:
     def slow_fast_config(self, **overrides) -> slow_fast_loop.SlowFastConfig:
         settings = {
             "action_period_s": self.action_period_s,
+            "state_dims": self.action_dims,
             "pose_dims": rot.POSE_DIMS,
             "delta_dims": rot.POSE_DIMS,
             "chunk_steps": self.chunk_steps,

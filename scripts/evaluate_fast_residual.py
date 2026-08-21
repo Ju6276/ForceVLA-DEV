@@ -240,7 +240,7 @@ def main() -> None:
         "--norm-stats-dir",
         type=pathlib.Path,
         default=pathlib.Path("assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56"),
-        help="Directory holding norm_stats.json. Enables physical units and contact stratification.",
+        help="Required directory holding norm_stats.json for absolute-pose and contact evaluation.",
     )
     parser.add_argument(
         "--contact-threshold-n",
@@ -268,6 +268,23 @@ def main() -> None:
         raise ValueError(
             f"Slow cache covers {len(cache.row_key_positions)} rows but Stage-3 has {len(arrays.dataset_indices)}"
         )
+    if args.norm_stats_dir is None or not (args.norm_stats_dir / "norm_stats.json").is_file():
+        raise ValueError(
+            f"--norm-stats-dir must point at a directory containing norm_stats.json (got {args.norm_stats_dir}). "
+            "Absolute poses cannot be reconstructed without it, and comparing raw normalized deltas would mix "
+            "the Slow packet's base state with the current row's."
+        )
+    norm_stats = normalize_lib.load(args.norm_stats_dir)
+
+    # Estimate the resting wrench from the true opening rows before removing rows
+    # whose Slow packet was not ready. Computing it after that subset silently moves
+    # the baseline 50--300 ms into the episode, potentially into contact.
+    wrench_by_row = fast_dataset.latest_physical_wrench(
+        arrays.force_history, arrays.force_history_mask, norm_stats["force_history"]
+    )
+    baseline_by_row = fast_dataset.episode_baseline_wrench(
+        wrench_by_row, arrays.episode_indices, num_rows=args.baseline_rows
+    )
     ready = np.flatnonzero(cache.row_ready) if cache.row_ready is not None else np.arange(len(arrays.dataset_indices))
     if len(ready) == 0:
         raise ValueError("Slow cache has no rows whose packet would already be ready")
@@ -315,13 +332,6 @@ def main() -> None:
     contact_summary: dict = {"available": False}
     strata: dict[str, np.ndarray] = {}
 
-    if args.norm_stats_dir is None or not (args.norm_stats_dir / "norm_stats.json").is_file():
-        raise ValueError(
-            f"--norm-stats-dir must point at a directory containing norm_stats.json (got {args.norm_stats_dir}). "
-            "Absolute poses cannot be reconstructed without it, and comparing raw normalized deltas would mix "
-            "the Slow packet's base state with the current row's."
-        )
-    norm_stats = normalize_lib.load(args.norm_stats_dir)
     units = "physical"
 
     # Reporting in metres and radians is what makes the numbers actionable;
@@ -337,10 +347,8 @@ def main() -> None:
     predictions = {name: value * scale for name, value in predictions.items()}
     residual_target = residual_target * scale
 
-    wrench = fast_dataset.latest_physical_wrench(
-        arrays.force_history, arrays.force_history_mask, norm_stats["force_history"]
-    )
-    baseline = fast_dataset.episode_baseline_wrench(wrench, arrays.episode_indices, num_rows=args.baseline_rows)
+    wrench = wrench_by_row[ready]
+    baseline = baseline_by_row[ready]
     magnitude = np.linalg.norm((wrench - baseline)[:, :3], axis=-1)
     in_contact = magnitude >= args.contact_threshold_n
     contact_summary = {

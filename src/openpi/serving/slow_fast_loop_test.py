@@ -170,6 +170,7 @@ def _controller(cache, *, residual=None, residual_limit=None, observer=None):
         unnormalize_action=lambda action: action,
         config=slow_fast_loop.SlowFastConfig(
             action_period_s=0.1,
+            state_dims=7,
             pose_dims=6,
             delta_dims=6,
             chunk_steps=2,
@@ -231,7 +232,12 @@ def test_controller_normalizes_masked_force_slots_the_way_training_does():
         normalize_force_history=lambda force: (force - mean) / std,
         unnormalize_action=lambda action: action,
         config=slow_fast_loop.SlowFastConfig(
-            action_period_s=0.1, pose_dims=6, delta_dims=6, chunk_steps=2, max_staleness_s=0.25
+            action_period_s=0.1,
+            state_dims=7,
+            pose_dims=6,
+            delta_dims=6,
+            chunk_steps=2,
+            max_staleness_s=0.25,
         ),
     ).step(1.0, np.zeros(7, dtype=np.float32))
 
@@ -278,7 +284,7 @@ def test_slow_worker_stamps_readiness_after_inference_and_bumps_the_version():
             np.ones((2,), dtype=np.bool_),
         ),
         cache=cache,
-        config=slow_fast_loop.SlowFastConfig(action_period_s=0.1, pose_dims=6, delta_dims=6),
+        config=slow_fast_loop.SlowFastConfig(action_period_s=0.1, state_dims=7, pose_dims=6, delta_dims=6),
         context_age_scale_s=0.3,
         period_s=0.1,
         clock=lambda: next(clock),
@@ -313,3 +319,103 @@ def test_controller_refuses_a_packet_without_an_intent_mask():
 
     with pytest.raises(ValueError, match="no intent mask"):
         _controller(cache).step(1.0, np.zeros(7))
+
+
+def test_production_controller_rejects_raw_7d_state_at_its_boundary():
+    cache = slow_fast_runtime.SlowReferenceCache()
+    cache.update(
+        _packet(
+            state_at_observation=np.zeros(rot.ROBOT_DIMS),
+            chunk=np.zeros((5, rot.ROBOT_DIMS), dtype=np.float32),
+        )
+    )
+    controller = slow_fast_loop.SlowFastController(
+        cache=cache,
+        force_buffer=_buffer(),
+        predict_residual=lambda **_: (np.zeros((2, rot.POSE_DIMS), dtype=np.float32), 1.0),
+        normalize_state=lambda state: state,
+        normalize_force_history=lambda force: force,
+        unnormalize_action=lambda action: action,
+        config=slow_fast_loop.SlowFastConfig(action_period_s=0.1, chunk_steps=2),
+    )
+
+    with pytest.raises(ValueError, match=r"10D xyz\+6D\+gripper"):
+        controller.step(1.0, np.zeros(7, dtype=np.float32))
+
+
+def test_fast_command_cache_skips_commands_that_expired_during_inference():
+    cache = slow_fast_loop.FastCommandCache()
+    cache.update(
+        slow_fast_loop.FastCommandPacket(
+            start_timestamp=1.0,
+            ready_timestamp=1.15,
+            commands=np.arange(12, dtype=np.float32).reshape(3, 4),
+            command_period_s=0.1,
+            version=0,
+            slow_packet_version=3,
+        )
+    )
+
+    sampled = cache.sample(1.15)
+
+    assert sampled["command_index"] == 1
+    assert sampled["slow_packet_version"] == 3
+    np.testing.assert_array_equal(sampled["command"], np.arange(4, 8, dtype=np.float32))
+
+
+def test_fast_command_cache_refuses_to_hold_an_expired_chunk():
+    cache = slow_fast_loop.FastCommandCache()
+    cache.update(
+        slow_fast_loop.FastCommandPacket(
+            start_timestamp=1.0,
+            ready_timestamp=1.01,
+            commands=np.zeros((2, 4), dtype=np.float32),
+            command_period_s=0.1,
+            version=0,
+            slow_packet_version=0,
+        )
+    )
+
+    with pytest.raises(slow_fast_loop.StaleFastCommandError):
+        cache.sample(1.21)
+
+
+def test_fast_worker_publishes_timestamped_chunks_for_an_independent_actuator_loop():
+    class Controller:
+        def step(self, timestamp, state):
+            np.testing.assert_allclose(timestamp, 1.0)
+            np.testing.assert_array_equal(state, np.arange(rot.ROBOT_DIMS, dtype=np.float32))
+            return {
+                "command": np.arange(21, dtype=np.float32).reshape(3, 7),
+                "command_period_s": 0.1,
+                "packet_version": 4,
+            }
+
+    cache = slow_fast_loop.FastCommandCache()
+    worker = slow_fast_loop.FastWorker(
+        observe=lambda: (1.0, np.arange(rot.ROBOT_DIMS, dtype=np.float32)),
+        controller=Controller(),
+        command_cache=cache,
+        period_s=0.05,
+        clock=lambda: 1.12,
+    )
+
+    packet = worker.publish_once()
+    sampled = cache.sample(1.12)
+
+    assert packet.version == 0
+    assert packet.slow_packet_version == 4
+    assert sampled["command_index"] == 1
+    np.testing.assert_array_equal(sampled["command"], np.arange(7, 14, dtype=np.float32))
+
+
+def test_fast_command_packet_enforces_one_clock_domain():
+    with pytest.raises(ValueError, match="one monotonic clock domain"):
+        slow_fast_loop.FastCommandPacket(
+            start_timestamp=10.0,
+            ready_timestamp=1.0,
+            commands=np.zeros((2, 7), dtype=np.float32),
+            command_period_s=0.1,
+            version=0,
+            slow_packet_version=0,
+        )
