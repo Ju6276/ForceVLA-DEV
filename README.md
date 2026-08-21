@@ -16,19 +16,14 @@ Stage 4  Intent Projector + Fast force residual student
 
 ## 状态
 
-| 项目 | 状态 |
-| --- | --- |
-| USB instantaneous baseline | 已训练，step `39999` |
-| USB 30 Hz Temporal Teacher | 已训练，step `40000` |
-| Button Stage 1–4 | 产物已全部删除，待重跑 |
+**没有任何已训练产物。** checkpoint、norm stats、Stage-3 targets、Slow cache 全部已删除，USB 与 Button
+两条线都要从 Stage 1 重跑。末端姿态改为 6D 连续旋转后归一化统计必须重算，旧 checkpoint 的输入输出布局
+也不再兼容，保留它们只会误导。
 
-Button 的 checkpoint、Stage-3 targets、Slow cache 和 norm stats 已于 2026-08-20 删除：末端姿态改为 6D
-连续旋转后，归一化统计必须重算，必须从 Stage 1 重跑。
+Slow/Fast 这条线在 2026-08-21 改过 6D 旋转、时序随机化、K 步 chunk 和部署契约。这些改动只有单元测试和
+合成数据 smoke 验证过，**没有跑过真实训练或真机**。
 
-Slow/Fast 这条线在 2026-08-21 改过 6D 旋转、时序随机化、K 步 chunk 和部署契约。这些改动只有单元测试
-和合成数据 smoke 验证过，**没有跑过真实训练或真机**。
-
-checkpoint、W&B 本地目录、`artifacts/`、`data/` 均被 Git 忽略。
+`assets/`、`checkpoints/`、`artifacts/`、`wandb/`、`data/` 均被 Git 忽略，仓库里只有代码。
 
 ## 安装
 
@@ -37,12 +32,16 @@ Ubuntu 22.04 + Python 3.11 + CUDA：
 ```bash
 git clone --recurse-submodules <repo-url>
 cd ForceVLA-DEV
+git submodule update --init lerobot dlimp   # 忘了 --recurse-submodules 时补这一步
 python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 pip install -e . && pip install -e lerobot && pip install -e packages/openpi-client
 ```
 
-跑测试要把 `flaxformer` 加进路径：
+`lerobot` 与 `dlimp` 是 submodule，pin 在 `.gitmodules`；`flaxformer` 直接 vendored 在仓库里，不用装，但
+要加进 `PYTHONPATH`。`third_party/aloha` 和 `third_party/libero` 只有跑那两个 benchmark 才需要。
+
+跑测试：
 
 ```bash
 PYTHONPATH=$PWD/src:$PWD/flaxformer python -m pytest src/openpi -q
@@ -59,24 +58,27 @@ data/panda_button_press_100hz_causal/raw_sidecars/episode_000000.npz
     timestamps: [M]
 ```
 
-LeRobot 按 `repo_id` 在 `~/.cache/huggingface/lerobot` 下找数据集，缺失时会尝试联网下载并失败：
+数据集本身不在仓库里，需要单独拿。LeRobot 按 `repo_id` 在 `~/.cache/huggingface/lerobot` 下找它，缺失
+时会尝试联网下载并失败，所以要软链到本地副本：
 
 ```bash
-ln -sfn /home/d024/datasets/panda_button_press_min100hz/panda_button_press \
-        ~/.cache/huggingface/lerobot/panda_button_press
+export BUTTON_RAW=<原始 100-episode 数据集路径>
+export BUTTON_DATA=<筛选后数据集的目标路径>
+
+ln -sfn "$BUTTON_DATA" ~/.cache/huggingface/lerobot/panda_button_press
 ```
 
 ### 力采样率过滤
 
 原始 100 episode 的力速率在 57–314 Hz 之间。`scripts/filter_dataset_by_force_rate.py` 按整段平均速率
 （`(n-1)/(t_last-t_first)`，而非中位间隔——中位数在丢包的流上仍然很高）筛选，并重建连续的 episode 编号
-和 dataset 级 frame index：
+和 dataset 级 frame index。加 `--dry-run` 只看选中结果不落盘：
 
 ```bash
 python scripts/filter_dataset_by_force_rate.py \
-    --dataset  /home/d024/datasets/panda_button_press_selected/panda_button_press \
+    --dataset  "$BUTTON_RAW" \
     --sidecars data/panda_button_press_100hz_causal/raw_sidecars_unfiltered_100ep \
-    --output   /home/d024/datasets/panda_button_press_min100hz/panda_button_press \
+    --output   "$BUTTON_DATA" \
     --sidecar-output data/panda_button_press_100hz_causal/raw_sidecars \
     --min-force-rate-hz 100
 ```
