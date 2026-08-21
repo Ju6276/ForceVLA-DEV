@@ -83,14 +83,8 @@ python scripts/filter_dataset_by_force_rate.py \
     --min-force-rate-hz 100
 ```
 
-100 Hz 阈值保留 66 条、37104 帧。这 66 条恰好就是 `_BUTTON_PRESS_TRAIN_EPISODES` 与
-`_BUTTON_PRESS_VAL_EPISODES` 原本使用的集合——`split.json` 里那个 `excluded_below_100hz` 字段说明建库时
-就按同一判据排除过——所以**参与训练的数据没有变化**，变的只是编号。`config.py` 里两个 split 的索引已按
-新编号重写；换阈值重跑过滤就必须同步重映射，否则 split 会静默错位。
-
-新编号只在数据集和 `config.py` 里生效。建库时留下的 `split.json`、`manifest.csv` 和 `episodes/` 仍是过滤
-前的 0–99 编号，`manifest.csv` 的 `effective_rate_hz` 一列是这次筛选的依据，留作溯源；训练不读它们。
-old→new 的对应关系可以从 `meta/force_rate_filter.json` 的 `dropped_episodes` 重建。
+100 Hz 阈值保留 66 条、37104 帧，`config.py` 里两个 split 的索引按新编号写死。换阈值重跑过滤就必须同步
+重映射这两串索引，否则 train/val 会静默错位。
 
 ## Button 完整重跑流程
 
