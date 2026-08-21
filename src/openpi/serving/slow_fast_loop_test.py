@@ -211,7 +211,13 @@ def test_controller_normalizes_the_force_window_before_the_student_sees_it():
 
 
 def test_controller_normalizes_masked_force_slots_the_way_training_does():
-    """Training fills invalid slots with zero and then normalizes, so they arrive as -mean/std."""
+    """The controller must reproduce the training transform, invalid slots included.
+
+    Training fills an invalid slot with zero and normalizes afterwards, so the value
+    handed on is -mean/std. It does not reach the network that way: both force
+    encoders multiply by `force_history_mask` before their stem, so re-zeroing here
+    would be equivalent. This pins the transform, not a value the model consumes.
+    """
     mean = np.arange(6, dtype=np.float32) + 1.0
     std = np.full(6, 2.0, dtype=np.float32)
     buffer = slow_fast_loop.ForceStreamBuffer(_history_transform())
@@ -419,3 +425,80 @@ def test_fast_command_packet_enforces_one_clock_domain():
             version=0,
             slow_packet_version=0,
         )
+
+
+def test_fast_command_cache_tolerates_the_actuator_clock_read_race():
+    """The actuator reads its clock before sampling; a packet installed in between
+    is not a clock-domain error and must not crash the real-time loop."""
+    cache = slow_fast_loop.FastCommandCache()
+    cache.update(
+        slow_fast_loop.FastCommandPacket(
+            start_timestamp=1.0,
+            ready_timestamp=1.05,
+            commands=np.arange(12, dtype=np.float32).reshape(3, 4),
+            command_period_s=0.1,
+            version=0,
+            slow_packet_version=0,
+        )
+    )
+
+    sampled = cache.sample(1.05 - 1e-5)
+
+    assert sampled["command_index"] == 0
+
+
+def test_fast_command_cache_still_reports_a_real_clock_domain_disagreement():
+    cache = slow_fast_loop.FastCommandCache()
+    cache.update(
+        slow_fast_loop.FastCommandPacket(
+            start_timestamp=1.0,
+            ready_timestamp=1.05,
+            commands=np.zeros((3, 4), dtype=np.float32),
+            command_period_s=0.1,
+            version=0,
+            slow_packet_version=0,
+        )
+    )
+
+    with pytest.raises(ValueError, match="one monotonic clock domain"):
+        cache.sample(0.8)
+
+
+def _worker(timestamps, cache=None):
+    class Controller:
+        def step(self, timestamp, state):
+            del timestamp, state
+            return {
+                "command": np.zeros((3, rot.ROBOT_DIMS), dtype=np.float32),
+                "command_period_s": 0.1,
+                "packet_version": 0,
+            }
+
+    stamps = iter(timestamps)
+    return slow_fast_loop.FastWorker(
+        observe=lambda: (next(stamps), np.zeros(rot.ROBOT_DIMS, dtype=np.float32)),
+        controller=Controller(),
+        command_cache=slow_fast_loop.FastCommandCache() if cache is None else cache,
+        period_s=0.02,
+        clock=lambda: 9.15,
+    )
+
+
+def test_fast_worker_treats_a_backwards_robot_timestamp_as_transient():
+    """One driver hiccup must not take Fast down for the rest of the run."""
+    worker = _worker([9.0, 8.9, 9.1])
+    worker.publish_once()
+
+    with pytest.raises(slow_fast_loop.StaleFastObservationError):
+        worker.publish_once()
+
+    # The worker is still usable, and the skipped cycle consumed no version.
+    assert worker.publish_once().start_timestamp == 9.1
+
+
+def test_fast_worker_skips_a_repeated_robot_timestamp_without_inference():
+    worker = _worker([9.0, 9.0])
+    worker.publish_once()
+
+    with pytest.raises(slow_fast_loop.StaleFastObservationError):
+        worker.publish_once()

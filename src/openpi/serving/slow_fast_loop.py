@@ -303,6 +303,15 @@ class StaleFastCommandError(RuntimeError):
     """Raised once every command in the latest Fast chunk has expired."""
 
 
+class StaleFastObservationError(RuntimeError):
+    """Raised when `observe` returns a timestamp no newer than the published chunk.
+
+    A momentarily repeated or backwards robot timestamp is a driver hiccup, not a
+    reason to take Fast down for the rest of the run, so the worker treats this as
+    transient and simply skips the cycle.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class FastCommandPacket:
     """One timestamped command chunk published by asynchronous Fast inference."""
@@ -375,9 +384,20 @@ class FastCommandCache:
         packet = self.snapshot()
         if not np.isfinite(timestamp):
             raise ValueError("Actuator timestamp must be finite")
-        if timestamp < packet.ready_timestamp:
-            raise ValueError("The actuator cannot consume a Fast command packet before it is ready")
-        position = max(0.0, timestamp - packet.start_timestamp) / packet.command_period_s
+        # The actuator reads its clock before it samples, so a packet installed in
+        # between carries a ready time a few microseconds ahead of it. That is a
+        # read-ordering artefact, not an error, and raising on it would crash the
+        # real-time loop on a benign race. A gap beyond one command period cannot be
+        # explained that way and does mean the two clocks disagree.
+        if packet.ready_timestamp - timestamp > packet.command_period_s:
+            raise ValueError(
+                f"The actuator clock is {packet.ready_timestamp - timestamp:.3f}s behind the Fast worker's; "
+                "sensor timestamps and the worker clock must share one monotonic clock domain"
+            )
+        # Selecting from the later of the two never returns a command whose interval
+        # had already closed by the time inference produced it.
+        elapsed = max(timestamp, packet.ready_timestamp) - packet.start_timestamp
+        position = max(0.0, elapsed) / packet.command_period_s
         command_index = int(np.floor(position + 1e-9))
         if command_index >= packet.commands.shape[0]:
             raise StaleFastCommandError(f"Fast command chunk expired by {timestamp - packet.expires_at:.3f}s")
@@ -411,6 +431,7 @@ class FastWorker:
         self._period_s = period_s
         self._clock = clock
         self._version = 0
+        self._published_start: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._error_lock = threading.Lock()
@@ -418,9 +439,20 @@ class FastWorker:
 
     def publish_once(self) -> FastCommandPacket:
         timestamp, state = self._observe()
-        result = self._controller.step(float(timestamp), state)
+        timestamp = float(timestamp)
+        if not np.isfinite(timestamp):
+            raise ValueError("Fast observe() must return a finite timestamp")
+        # Checked before inference rather than at the cache, so a repeated robot
+        # timestamp costs nothing and a backwards one cannot reach the strict
+        # monotonicity invariant the cache uses to catch real programming errors.
+        if self._published_start is not None and timestamp <= self._published_start:
+            raise StaleFastObservationError(
+                f"observe() returned t={timestamp:.6f}, which does not advance on the published "
+                f"t={self._published_start:.6f}; there is nothing new to compute"
+            )
+        result = self._controller.step(timestamp, state)
         packet = FastCommandPacket(
-            start_timestamp=float(timestamp),
+            start_timestamp=timestamp,
             ready_timestamp=float(self._clock()),
             commands=np.asarray(result["command"], dtype=np.float32),
             command_period_s=float(result["command_period_s"]),
@@ -428,6 +460,7 @@ class FastWorker:
             slow_packet_version=int(result["packet_version"]),
         )
         self._command_cache.update(packet)
+        self._published_start = timestamp
         self._version += 1
         return packet
 
@@ -450,6 +483,7 @@ class FastWorker:
                 slow_fast_runtime.MissingSlowReferenceError,
                 slow_fast_runtime.StaleSlowReferenceError,
                 StaleFastCommandError,
+                StaleFastObservationError,
             ):
                 # Slow startup and replacement are transient; keep trying rather
                 # than killing Fast. A one-off over-budget Fast call is handled the

@@ -358,9 +358,16 @@ except (slow_fast_loop.MissingFastCommandError, slow_fast_loop.StaleFastCommandE
 ```
 
 `normalize_force_history` 是必填参数，没有默认值：Fast 是在归一化后的力上训的，直接喂原始牛顿值在偏置和
-量级上都错，但不会触发任何形状检查。归一化作用于整个零填充窗口；随后 TCN 和训练时一样用 mask 将无效
-slot 清零。`controller.step()` 的 state 则严格要求已经通过 `convert_robot_state()` 转为10D，原始7D state
-会在模型调用前直接报错。
+量级上都错，但不会触发任何形状检查。归一化作用于整个零填充窗口；无效 slot 归一化后是 `-mean/std`，但
+两个力编码器都在 stem 之前乘 `force_history_mask`，所以模型看到的仍是 0——在 controller 里额外清零是等价
+的，不清零也不会失配。`controller.step()` 的 state 则严格要求已经通过 `convert_robot_state()` 转成 10D，
+原始 7D state 会在模型调用前直接报错。
+
+actuator 侧只需捕获两类异常：`MissingFastCommandError`（Fast 还没发布首个 chunk）和
+`StaleFastCommandError`（整个 chunk 已过期）。`sample()` 容忍亚周期的时钟读取竞态——actuator 先读时钟、
+worker 随后装入 packet 是正常的读序，不是错误——只在两个时钟真正相差超过一个 command period 时抛
+`ValueError`。Fast worker 对时间戳不前进的观测按 transient 跳过（`StaleFastObservationError`），一次驱动
+抖动不会让它永久停机。
 
 形状从 cache 的 summary 读，**时序带必须从 Fast 训练 run 的 `metadata.json` 读**——推荐的 train cache 是
 全速率提取的，它自己记录的带是退化的 `[0, 0]`。上机前用
