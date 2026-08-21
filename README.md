@@ -207,11 +207,13 @@ context/state/reference 猜 residual。
 
 重点看三项：
 
-- `deployment_error_decomposition`：`(A_ref + delta) - A_full = (A_ref - A_null) + (delta - (A_full - A_null))`
-  精确拆成一个与力无关的 Slow 项和唯一被训练的 Fast 项。两项都含 `A_null`，**不能相加**，只比量级。
-  如果 Slow 项比整个力修正信号还大，组合改善就会被分母锁死，此时该去降 Slow 误差而不是调 Fast。
+- `deployment_error_decomposition`：Slow 与总组合误差分别报告物理平移 RMSE（米）和 SO(3) 测地线旋转
+  RMSE（弧度）；Fast 项报告它实际优化的 normalized residual MSE。三者单位不同，不能相加，只用于定位误差
+  来自 Slow reference、Fast residual，还是最终组合。
 - `per_step_residual_mse_normalized`：chunk 后几步是否也学到了。
-- 分平移 / 测地线旋转的物理误差。各模型的旋转误差是否拉开差距，是 6D 改造是否奏效的判据。
+- 分平移 / 测地线旋转的物理误差。报告不再给出把 xyz 米和无量纲 6D 坐标混在一起的总体 pose MSE；
+  `rotation_6d_coordinate_rmse` 只作表示诊断，模型排序看 `translation_rmse_m` 和
+  `rotation_geodesic_rmse_rad`。
 
 ## 设计要点
 

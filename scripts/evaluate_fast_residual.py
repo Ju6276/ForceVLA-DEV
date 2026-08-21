@@ -28,11 +28,6 @@ ROTATION_6D_DIMS = slice(3, 9)
 POSE_DIM_NAMES = ("x", "y", "z", "r6d_0", "r6d_1", "r6d_2", "r6d_3", "r6d_4", "r6d_5")
 
 
-def _pose_difference(prediction: np.ndarray, target: np.ndarray, *, physical: bool) -> np.ndarray:
-    del physical
-    return np.asarray(prediction, dtype=np.float64) - np.asarray(target, dtype=np.float64)
-
-
 def to_absolute_pose(delta: np.ndarray, base_state: np.ndarray, action_stats, state_stats) -> np.ndarray:
     """Rebase a normalized delta action onto its base state, in metres and radians.
 
@@ -109,21 +104,25 @@ def _predict_all(model, arrays, cache, *, batch_size: int, seed: int) -> dict[st
     return {name: np.concatenate(parts) for name, parts in predictions.items()}
 
 
-def _pose_error_summary(prediction: np.ndarray, target: np.ndarray, *, physical: bool) -> dict:
-    error = _pose_difference(prediction, target, physical=physical)
-    if physical and prediction.shape[-1] >= rot.POSE_DIMS:
-        geodesic = rot.geodesic_angle(
-            rot.sixd_to_matrix(np.asarray(prediction)[:, ROTATION_6D_DIMS]),
-            rot.sixd_to_matrix(np.asarray(target)[:, ROTATION_6D_DIMS]),
-        )
-        rotation_rmse = float(np.sqrt(np.mean(np.square(geodesic))))
-    else:
-        rotation_rmse = float(np.sqrt(np.mean(np.sum(np.square(error[:, ROTATION_6D_DIMS]), axis=-1))))
+def physical_pose_error_summary(prediction: np.ndarray, target: np.ndarray) -> dict:
+    """Report physical translation and rotation without mixing their units.
+
+    The 6D rotation coordinates are useful diagnostics but are dimensionless; an
+    aggregate MSE over xyz metres and those six coordinates has no physical unit.
+    Rotation quality is therefore ranked only by the SO(3) geodesic angle.
+    """
+    prediction = np.asarray(prediction, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    error = prediction - target
+    geodesic = rot.geodesic_angle(
+        rot.sixd_to_matrix(prediction[:, ROTATION_6D_DIMS]),
+        rot.sixd_to_matrix(target[:, ROTATION_6D_DIMS]),
+    )
     return {
-        "mse": float(np.mean(np.square(error))),
-        "translation_rmse": float(np.sqrt(np.mean(np.sum(np.square(error[:, TRANSLATION_DIMS]), axis=-1)))),
-        "rotation_rmse": rotation_rmse,
-        "per_dim_rmse": {
+        "translation_rmse_m": float(np.sqrt(np.mean(np.sum(np.square(error[:, TRANSLATION_DIMS]), axis=-1)))),
+        "rotation_geodesic_rmse_rad": float(np.sqrt(np.mean(np.square(geodesic)))),
+        "rotation_6d_coordinate_rmse": float(np.sqrt(np.mean(np.square(error[:, ROTATION_6D_DIMS])))),
+        "per_dim_coordinate_rmse": {
             name: float(np.sqrt(np.mean(np.square(error[:, index])))) for index, name in enumerate(POSE_DIM_NAMES)
         },
     }
@@ -131,69 +130,65 @@ def _pose_error_summary(prediction: np.ndarray, target: np.ndarray, *, physical:
 
 def _stratum_metrics(
     poses: dict[str, np.ndarray],
-    predictions: dict[str, np.ndarray],
-    residual_target,
-    *,
-    physical: bool,
+    physical_predictions: dict[str, np.ndarray],
+    normalized_predictions: dict[str, np.ndarray],
+    normalized_residual_target: np.ndarray,
 ) -> dict:
     """Compare every variant against both the Teacher and the true expert."""
     reference = poses["reference"]
     metrics: dict = {
         "rows": len(reference),
-        "residual_vs_teacher_deviation": {"zero_residual_baseline_mse": float(np.mean(np.square(residual_target)))},
+        "residual_vs_teacher_deviation": {
+            "space": "normalized pose residual",
+            "zero_residual_baseline_mse_normalized": float(np.mean(np.square(normalized_residual_target))),
+        },
         "action_vs_teacher_full": {
-            "slow_reference_only": _pose_error_summary(reference, poses["teacher_full"], physical=physical)
+            "slow_reference_only": physical_pose_error_summary(reference, poses["teacher_full"])
         },
         "action_vs_expert": {
-            "slow_reference_only": _pose_error_summary(reference, poses["expert"], physical=physical),
-            "teacher_full": _pose_error_summary(poses["teacher_full"], poses["expert"], physical=physical),
-            "teacher_null": _pose_error_summary(poses["teacher_null"], poses["expert"], physical=physical),
+            "slow_reference_only": physical_pose_error_summary(reference, poses["expert"]),
+            "teacher_full": physical_pose_error_summary(poses["teacher_full"], poses["expert"]),
+            "teacher_null": physical_pose_error_summary(poses["teacher_null"], poses["expert"]),
         },
     }
-    baseline = metrics["residual_vs_teacher_deviation"]["zero_residual_baseline_mse"]
-    for name, prediction in predictions.items():
-        commanded = reference + prediction
+    baseline = metrics["residual_vs_teacher_deviation"]["zero_residual_baseline_mse_normalized"]
+    for name, normalized_prediction in normalized_predictions.items():
+        commanded = reference + physical_predictions[name]
         metrics["residual_vs_teacher_deviation"][name] = {
-            "mse": float(np.mean(np.square(prediction - residual_target))),
-            "predicted_l2_mean": float(np.mean(np.linalg.norm(prediction, axis=-1))),
+            "mse_normalized": float(np.mean(np.square(normalized_prediction - normalized_residual_target))),
+            "predicted_l2_mean_normalized": float(np.mean(np.linalg.norm(normalized_prediction, axis=-1))),
         }
         metrics["residual_vs_teacher_deviation"][name]["gain_vs_zero_residual"] = 1.0 - metrics[
             "residual_vs_teacher_deviation"
-        ][name]["mse"] / max(baseline, 1e-12)
-        metrics["action_vs_teacher_full"][f"slow_plus_{name}"] = _pose_error_summary(
-            commanded, poses["teacher_full"], physical=physical
+        ][name]["mse_normalized"] / max(baseline, 1e-12)
+        metrics["action_vs_teacher_full"][f"slow_plus_{name}"] = physical_pose_error_summary(
+            commanded, poses["teacher_full"]
         )
-        metrics["action_vs_expert"][f"slow_plus_{name}"] = _pose_error_summary(
-            commanded, poses["expert"], physical=physical
-        )
+        metrics["action_vs_expert"][f"slow_plus_{name}"] = physical_pose_error_summary(commanded, poses["expert"])
 
-    # Translation and rotation are reported separately: an inflated rotation
-    # error would otherwise hide a genuine translation improvement.
-    for group, baseline_name in (("action_vs_expert", "expert"), ("action_vs_teacher_full", "teacher_full")):
-        del baseline_name
+    physical_error_keys = ("translation_rmse_m", "rotation_geodesic_rmse_rad")
+    for group in ("action_vs_expert", "action_vs_teacher_full"):
         section = metrics[group]
         section["fast_gain_vs_slow_only"] = {
             key: 1.0 - section["slow_plus_full"][key] / max(section["slow_reference_only"][key], 1e-12)
-            for key in ("mse", "translation_rmse", "rotation_rmse")
+            for key in physical_error_keys
         }
-    # The commanded action's deviation from the Teacher splits exactly, as vectors,
-    # into a force-agnostic Slow term and the Fast term the loss optimizes:
-    #   (reference + delta) - A_full = (reference - A_null) + (delta - residual_target)
-    # Only the second term is trained, so the first bounds what Fast can achieve.
-    # The two mean squares do not add up to the total: the terms share A_null, so
-    # there is a cross term. Compare their magnitudes; read `total_mse` for the sum.
+    # Do not collapse this into one physical MSE: xyz is measured in metres while
+    # 6D rotation coordinates are dimensionless. The Slow and total terms are
+    # physical pose summaries; the Fast term is the normalized loss it actually
+    # optimizes.
     metrics["deployment_error_decomposition"] = {
-        "slow_term_mse": float(
-            np.mean(np.square(reference[..., : poses["teacher_null"].shape[-1]] - poses["teacher_null"]))
-        ),
-        "fast_term_mse": metrics["residual_vs_teacher_deviation"]["full"]["mse"],
-        "total_mse": metrics["action_vs_teacher_full"]["slow_plus_full"]["mse"],
+        "slow_reference_vs_teacher_null_physical": physical_pose_error_summary(reference, poses["teacher_null"]),
+        "fast_residual_vs_teacher_deviation_mse_normalized": metrics["residual_vs_teacher_deviation"]["full"][
+            "mse_normalized"
+        ],
+        "composed_vs_teacher_full_physical": metrics["action_vs_teacher_full"]["slow_plus_full"],
     }
     metrics["action_vs_expert"]["teacher_force_gain"] = {
         key: 1.0
         - metrics["action_vs_expert"]["teacher_full"][key]
         / max(metrics["action_vs_expert"]["teacher_null"][key], 1e-12)
-        for key in ("mse", "translation_rmse", "rotation_rmse")
+        for key in physical_error_keys
     }
     return metrics
 
@@ -205,30 +200,35 @@ def _print_report(metrics: dict) -> None:
     print("  per-step residual mse (normalized): " + "  ".join(f"k{k}={v:.6f}" for k, v in enumerate(per_step)))
     for stratum, values in metrics["strata"].items():
         print(f"\n[{stratum}]  rows={values['rows']}")
-        physical = metrics["units"] == "physical"
-        unit = "m / rad" if physical else "normalized"
-        print(f"  action error vs ground-truth expert ({unit}):")
+        print("  action error vs ground-truth expert:")
         for name in ("slow_reference_only", "slow_plus_full", "teacher_null", "teacher_full"):
             item = values["action_vs_expert"][name]
-            per_dim = "  ".join(f"{key}={value:.5f}" for key, value in item["per_dim_rmse"].items())
+            per_dim = "  ".join(f"{key}={value:.5f}" for key, value in item["per_dim_coordinate_rmse"].items())
             print(
-                f"    {name:<22} mse={item['mse']:.6f}  "
-                f"trans_rmse={item['translation_rmse']:.5f}  rot_rmse={item['rotation_rmse']:.5f}"
+                f"    {name:<22} translation={item['translation_rmse_m']:.5f} m  "
+                f"rotation={item['rotation_geodesic_rmse_rad']:.5f} rad  "
+                f"r6d_coord={item['rotation_6d_coordinate_rmse']:.5f}"
             )
-            print(f"      per-dim rmse: {per_dim}")
+            print(f"      per-dim coordinate rmse: {per_dim}")
         for label, key in (
             ("fast vs slow-only", "fast_gain_vs_slow_only"),
             ("teacher force gain", "teacher_force_gain"),
         ):
             gain = values["action_vs_expert"][key]
             print(
-                f"    {label:<20} mse={gain['mse'] * 100:+.2f}%  "
-                f"translation={gain['translation_rmse'] * 100:+.2f}%  rotation={gain['rotation_rmse'] * 100:+.2f}%"
+                f"    {label:<20} translation={gain['translation_rmse_m'] * 100:+.2f}%  "
+                f"rotation={gain['rotation_geodesic_rmse_rad'] * 100:+.2f}%"
             )
         residual = values["residual_vs_teacher_deviation"]
-        print(f"  Teacher deviation reproduction (zero baseline={residual['zero_residual_baseline_mse']:.6f}):")
+        print(
+            "  Teacher deviation reproduction, normalized "
+            f"(zero baseline={residual['zero_residual_baseline_mse_normalized']:.6f}):"
+        )
         for name in ("full", "zero_force", "shuffled_force"):
-            print(f"    {name:<22} mse={residual[name]['mse']:.6f}  gain={residual[name]['gain_vs_zero_residual']:.4f}")
+            print(
+                f"    {name:<22} mse={residual[name]['mse_normalized']:.6f}  "
+                f"gain={residual[name]['gain_vs_zero_residual']:.4f}"
+            )
 
 
 def main() -> None:
@@ -313,7 +313,7 @@ def main() -> None:
         ]
         for name, value in chunk_predictions.items()
     }
-    predictions = {name: value[:, 0] for name, value in chunk_predictions.items()}
+    normalized_predictions = {name: value[:, 0] for name, value in chunk_predictions.items()}
 
     # Each delta is scored against the state it was produced from.
     base_state = {
@@ -328,11 +328,9 @@ def main() -> None:
         "teacher_null": arrays.null_pose[:, 0],
         "expert": arrays.expert_pose[:, 0],
     }
-    residual_target = arrays.residual_pose[:, 0]
+    normalized_residual_target = arrays.residual_pose[:, 0]
     contact_summary: dict = {"available": False}
     strata: dict[str, np.ndarray] = {}
-
-    units = "physical"
 
     # Reporting in metres and radians is what makes the numbers actionable;
     # normalized MSE cannot tell whether an error is safe on hardware.
@@ -344,8 +342,7 @@ def main() -> None:
     # The residual is a difference of two deltas sharing one base, so it needs
     # only the scale, not the offset.
     scale = (np.asarray(action_stats.std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(np.float32)
-    predictions = {name: value * scale for name, value in predictions.items()}
-    residual_target = residual_target * scale
+    physical_predictions = {name: value * scale for name, value in normalized_predictions.items()}
 
     wrench = wrench_by_row[ready]
     baseline = baseline_by_row[ready]
@@ -375,20 +372,26 @@ def main() -> None:
         strata["free_space"] = ~in_contact
 
     metrics = {
-        "rows": len(residual_target),
-        "units": units,
+        "rows": len(normalized_residual_target),
+        "action_units": {"translation": "metres", "rotation": "radians_geodesic"},
+        "residual_mse_space": "normalized_pose_residual",
         "chunk_steps": cache.chunk_steps,
         "per_step_residual_mse_normalized": per_step_residual_mse,
         "norm_stats_dir": str(args.norm_stats_dir),
         "contact": contact_summary,
         "strata": {
-            "all": _stratum_metrics(poses, predictions, residual_target, physical=units == "physical"),
+            "all": _stratum_metrics(
+                poses,
+                physical_predictions,
+                normalized_predictions,
+                normalized_residual_target,
+            ),
             **{
                 name: _stratum_metrics(
                     {key: value[selector] for key, value in poses.items()},
-                    {key: value[selector] for key, value in predictions.items()},
-                    residual_target[selector],
-                    physical=units == "physical",
+                    {key: value[selector] for key, value in physical_predictions.items()},
+                    {key: value[selector] for key, value in normalized_predictions.items()},
+                    normalized_residual_target[selector],
                 )
                 for name, selector in strata.items()
             },

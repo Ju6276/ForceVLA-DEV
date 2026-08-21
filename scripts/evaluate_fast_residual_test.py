@@ -66,3 +66,17 @@ def test_rebased_rotation_is_a_usable_rotation_but_the_raw_delta_is_not():
     # Gram-Schmidt happily returns a valid rotation matrix for that near-zero
     # vector, which is exactly why the old code produced plausible-looking numbers.
     assert np.allclose(np.linalg.det(rot.sixd_to_matrix(tiny_delta[:, rot.XYZ_DIMS : rot.POSE_DIMS])), 1.0, atol=1e-4)
+
+
+def test_physical_pose_report_never_mixes_metres_with_6d_coordinates():
+    target = np.zeros((1, rot.POSE_DIMS), dtype=np.float32)
+    target[:, rot.XYZ_DIMS :] = rot.rpy_to_6d(np.zeros((1, 3), dtype=np.float32))
+    prediction = target.copy()
+    prediction[:, 0] = 0.1
+    prediction[:, rot.XYZ_DIMS :] = rot.rpy_to_6d(np.array([[0.0, 0.0, 0.2]], dtype=np.float32))
+
+    summary = evaluate_fast_residual.physical_pose_error_summary(prediction, target)
+
+    assert "mse" not in summary
+    np.testing.assert_allclose(summary["translation_rmse_m"], 0.1, atol=1e-6)
+    np.testing.assert_allclose(summary["rotation_geodesic_rmse_rad"], 0.2, atol=1e-6)
