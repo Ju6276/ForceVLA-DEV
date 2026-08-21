@@ -87,6 +87,8 @@ def main() -> None:
         arrays["key_ready_delays"] = resampled.key_ready_delays
     if resampled.row_ready is not None:
         arrays["row_ready"] = resampled.row_ready
+    if resampled.key_grid_timestamps is not None:
+        arrays["key_grid_timestamps"] = resampled.key_grid_timestamps
     args.output.parent.mkdir(parents=True, exist_ok=True)
     tmp = args.output.with_suffix(args.output.suffix + ".tmp")
     np.savez_compressed(tmp, **arrays)

@@ -8,7 +8,8 @@ extraction applies and that a hand-written deployment loop silently gets wrong:
 
 - the action chunk is truncated to the model's xyz+6D+gripper dimensions;
 - the vision-language prefix is mean-pooled into the same number of bins;
-- the robot state is rewritten into 6D before it is used to undo `DeltaActions`.
+- the robot state is rewritten into 6D before it is used to undo `DeltaActions`;
+- the state and the force window are normalized with the training statistics.
 
 The shapes are read from the artifact Fast was trained against, so they cannot
 drift away from it.
@@ -16,6 +17,7 @@ drift away from it.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import dataclasses
 import json
 import pathlib
@@ -83,9 +85,7 @@ def _band(values, scale: float = 1.0) -> tuple[float, float] | None:
     return None if low <= 0 and high <= 0 else (low, high)
 
 
-def load_contract(
-    slow_cache: str | pathlib.Path, *, fast_run: str | pathlib.Path | None = None
-) -> DeploymentContract:
+def load_contract(slow_cache: str | pathlib.Path, *, fast_run: str | pathlib.Path | None = None) -> DeploymentContract:
     """Read the deployment contract from the summary written beside a Slow cache.
 
     The summary is used rather than the npz because a full-rate cache holds every
@@ -155,17 +155,50 @@ class SlowPacketBuilder:
             raise ValueError("The Slow thread runs one observation at a time")
         if chunk.shape[-1] < self.contract.action_dims:
             raise ValueError(
-                f"The Teacher produced {chunk.shape[-1]}D actions but the contract needs "
-                f"{self.contract.action_dims}D"
+                f"The Teacher produced {chunk.shape[-1]}D actions but the contract needs {self.contract.action_dims}D"
             )
-        pooled, pooled_mask = fast_dataset.pool_context_tokens(
-            context, mask, num_tokens=self.contract.context_tokens
-        )
+        pooled, pooled_mask = fast_dataset.pool_context_tokens(context, mask, num_tokens=self.contract.context_tokens)
         return (
             chunk[0, :, : self.contract.action_dims],
             np.asarray(pooled[0], dtype=np.float32),
             np.asarray(pooled_mask[0], dtype=np.bool_),
         )
+
+
+def load_normalizers(norm_stats) -> dict[str, Callable[[np.ndarray], np.ndarray]]:
+    """Build the deployment normalizers from the norm stats the model was trained with.
+
+    `state` and `force_history` are both normalized inside the training transform
+    pipeline, so the runtime has to apply the same affine map before the student
+    sees either of them. Reproducing `transforms.Normalize` here rather than
+    reusing it keeps the runtime free of the tree-structured data dict.
+    """
+    missing = [key for key in ("state", "force_history", "actions") if key not in norm_stats]
+    if missing:
+        raise ValueError(f"The norm stats are missing {missing}, which the runtime normalizes")
+
+    def affine(key: str, *, invert: bool) -> Callable[[np.ndarray], np.ndarray]:
+        mean = np.asarray(norm_stats[key].mean, dtype=np.float32)
+        std = np.asarray(norm_stats[key].std, dtype=np.float32)
+
+        def apply(value) -> np.ndarray:
+            array = np.asarray(value, dtype=np.float32)
+            width = array.shape[-1]
+            if width > mean.shape[-1]:
+                raise ValueError(f"{key} is {width}D but its norm stats only cover {mean.shape[-1]}D")
+            # The stats are stored at the padded model width while the runtime works
+            # at the robot width. Normalization is elementwise, so the leading slice
+            # of the padded map is the same affine transform.
+            offset, scale = mean[:width], std[:width] + 1e-6
+            return array * scale + offset if invert else (array - offset) / scale
+
+        return apply
+
+    return {
+        "normalize_state": affine("state", invert=False),
+        "normalize_force_history": affine("force_history", invert=False),
+        "unnormalize_action": affine("actions", invert=True),
+    }
 
 
 def convert_robot_state(raw_state) -> np.ndarray:

@@ -1,3 +1,4 @@
+import dataclasses
 import json
 
 import jax.numpy as jnp
@@ -123,7 +124,38 @@ def _full_rate_cache(episodes, times, chunks, *, chunk_steps=1):
         time_features=time_features,
         context_age_scale_s=0.5,
         action_period_s=1 / 30,
+        key_grid_timestamps=times,
     )
+
+
+def test_resample_redraws_jitter_from_the_lattice_not_from_the_source_cache():
+    """Jittering an already jittered cache widens the band past the one requested."""
+    episodes = np.zeros(90, dtype=np.int64)
+    times = np.arange(90) / 30.0
+    chunks = np.zeros((90, 8, 7), dtype=np.float32)
+    cache = _full_rate_cache(episodes, times, chunks)
+    # A source cache that was itself extracted with jitter, as the default does.
+    jittered = dataclasses.replace(
+        cache, key_timestamps=fast_dataset.jitter_key_timestamps(times, jitter_s=0.01, rng=0)
+    )
+
+    resampled = fast_dataset.resample_slow_cache(
+        jittered, episodes, times, slow_rate_range_hz=30.0, jitter_s=0.01, rng=1
+    )
+
+    offsets = resampled.key_timestamps - times[resampled.key_dataset_indices]
+    assert np.max(np.abs(offsets)) <= 0.01 + 1e-12, "Jitter was applied on top of the source cache's jitter"
+
+
+def test_resample_refuses_a_cache_without_the_lattice_timestamps():
+    episodes = np.zeros(90, dtype=np.int64)
+    times = np.arange(90) / 30.0
+    cache = dataclasses.replace(
+        _full_rate_cache(episodes, times, np.zeros((90, 8, 7), dtype=np.float32)), key_grid_timestamps=None
+    )
+
+    with pytest.raises(ValueError, match="key_grid_timestamps"):
+        fast_dataset.resample_slow_cache(cache, episodes, times, slow_rate_range_hz=10.0)
 
 
 def test_resample_slow_cache_matches_direct_extraction():
@@ -133,9 +165,7 @@ def test_resample_slow_cache_matches_direct_extraction():
     cache = _full_rate_cache(episodes, times, chunks)
 
     for rate_hz in (1.0, 5.0, 30.0):
-        resampled = fast_dataset.resample_slow_cache(
-            cache, episodes, times, slow_rate_range_hz=rate_hz, jitter_s=0.0
-        )
+        resampled = fast_dataset.resample_slow_cache(cache, episodes, times, slow_rate_range_hz=rate_hz, jitter_s=0.0)
         key_rows, mapping = fast_dataset.select_slow_update_rows(
             episodes, times, period_range_s=(1.0 / rate_hz, 1.0 / rate_hz)
         )
@@ -244,9 +274,7 @@ def test_assign_ready_packets_hides_keys_until_latency_elapses():
     episodes = np.zeros(6, dtype=np.int64)
     times = np.arange(6) / 30.0
     key_rows = np.array([0, 3], dtype=np.int64)
-    mapping = fast_dataset.assign_ready_packets(
-        episodes, times, key_rows, times[key_rows], ready_delay_s=0.1
-    )
+    mapping = fast_dataset.assign_ready_packets(episodes, times, key_rows, times[key_rows], ready_delay_s=0.1)
     # 100 ms is exactly three 30 Hz frames, so rows 0-2 have no ready packet.
     np.testing.assert_array_equal(mapping, [-1, -1, -1, 0, 0, 0])
 
@@ -270,9 +298,7 @@ def test_sampled_ready_delays_span_the_requested_band():
     delays = fast_dataset.sample_ready_delays(2000, delay_range_s=(0.05, 0.30), rng=0)
     assert 0.05 <= delays.min() and delays.max() <= 0.30
     assert delays.min() < 0.06 and delays.max() > 0.29
-    np.testing.assert_array_equal(
-        fast_dataset.sample_ready_delays(4, delay_range_s=0.1), np.full(4, 0.1)
-    )
+    np.testing.assert_array_equal(fast_dataset.sample_ready_delays(4, delay_range_s=0.1), np.full(4, 0.1))
 
 
 def test_jittered_key_times_train_interpolation_alphas():
@@ -305,4 +331,3 @@ def test_jittered_key_times_train_interpolation_alphas():
     assert 0.0 < alpha < 1.0
     np.testing.assert_allclose(jittered_features[1, 0], np.clip(age / 0.3, 0.0, 1.0), atol=1e-6)
     np.testing.assert_allclose(jittered_features[1, 1], alpha, atol=1e-6)
-

@@ -179,6 +179,7 @@ class SlowFastController:
         force_buffer: ForceStreamBuffer,
         predict_residual: Callable[..., tuple[np.ndarray, float]],
         normalize_state: Callable[[np.ndarray], np.ndarray],
+        normalize_force_history: Callable[[np.ndarray], np.ndarray],
         unnormalize_action: Callable[[np.ndarray], np.ndarray],
         config: SlowFastConfig,
     ):
@@ -186,6 +187,10 @@ class SlowFastController:
         self._force_buffer = force_buffer
         self._predict_residual = predict_residual
         self._normalize_state = normalize_state
+        # Required rather than defaulted: the student was trained on normalized
+        # wrench, and raw newtons are off by both an offset and an order of
+        # magnitude without failing any shape check.
+        self._normalize_force_history = normalize_force_history
         self._unnormalize_action = unnormalize_action
         self._config = config
 
@@ -212,6 +217,15 @@ class SlowFastController:
         )
         time_features = slow_fast_runtime.reference_time_features(packet, timestamp)
         force_history, force_mask = self._force_buffer.window(timestamp)
+        # Training normalizes the whole zero-filled window, so an invalid slot
+        # reaches the student as -mean/std rather than 0. Re-zeroing the masked
+        # slots here would look tidier and would not match what it was trained on.
+        raw_shape = force_history.shape
+        force_history = np.asarray(self._normalize_force_history(force_history), dtype=np.float32)
+        if force_history.shape != raw_shape:
+            raise ValueError(
+                f"Normalizing the force window changed its shape from {raw_shape} to {force_history.shape}"
+            )
         residual, gate = self._predict_residual(
             intent_tokens=packet.intent_tokens,
             intent_mask=packet.intent_mask,

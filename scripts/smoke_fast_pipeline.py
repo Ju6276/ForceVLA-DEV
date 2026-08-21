@@ -47,7 +47,9 @@ def _write_stage3(root: pathlib.Path) -> None:
         normalized_expert_actions=full,
     )
     (root / "manifest.json").write_text(
-        json.dumps({"complete": True, "extraction_size": ROWS, "shards": [{"complete": True, "path": "shards/rows.npz"}]})
+        json.dumps(
+            {"complete": True, "extraction_size": ROWS, "shards": [{"complete": True, "path": "shards/rows.npz"}]}
+        )
     )
 
 
@@ -80,6 +82,7 @@ def _full_rate_cache(arrays) -> fast_dataset.SlowCache:
         action_period_s=1.0 / ACTION_RATE_HZ,
         key_ready_delays=np.zeros(len(key_rows)),
         row_ready=np.ones(ROWS, dtype=bool),
+        key_grid_timestamps=arrays.timestamps[key_rows],
     )
 
 
@@ -142,9 +145,9 @@ def main() -> None:
             interior = float(np.mean((alpha > 1e-3) & (alpha < 1 - 1e-3)))
             assert interior > 0.5, f"alpha collapsed onto the action lattice ({interior:.3f}); jitter is off"
             _check_serving_matches_offline(cache, arrays)
-        assert not np.array_equal(
-            realizations[0].key_timestamps, realizations[1].key_timestamps
-        ), "redrawing the timing must actually change the realization"
+        assert not np.array_equal(realizations[0].key_timestamps, realizations[1].key_timestamps), (
+            "redrawing the timing must actually change the realization"
+        )
 
         config = slow_fast.FastResidualConfig(
             chunk_steps=CHUNK_STEPS,
@@ -189,9 +192,7 @@ def main() -> None:
                 train=True,
             )
             assert predicted.shape == (len(indices), CHUNK_STEPS, 9)
-            return slow_fast_distillation.fast_residual_loss(
-                predicted, reference_chunk, targets, loss_config
-            )[0]
+            return slow_fast_distillation.fast_residual_loss(predicted, reference_chunk, targets, loss_config)[0]
 
         before = float(loss_fn(model))
         for _ in range(30):

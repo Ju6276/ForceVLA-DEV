@@ -62,6 +62,10 @@ class SlowCache:
     # extraction, so a single scalar cannot describe the cache.
     key_ready_delays: np.ndarray | None = None
     row_ready: np.ndarray | None = None
+    # The on-lattice row timestamps before jitter was added. Resampling redraws
+    # jitter from these, so a source cache that was itself jittered cannot
+    # compound into a wider distribution than the one that was asked for.
+    key_grid_timestamps: np.ndarray | None = None
 
     @property
     def chunk_steps(self) -> int:
@@ -388,9 +392,7 @@ def resample_slow_cache(
         rng=rng,
     )
     if len(timestamps) != len(cache.row_key_positions):
-        raise ValueError(
-            f"Cache covers {len(cache.row_key_positions)} rows but {len(timestamps)} were supplied"
-        )
+        raise ValueError(f"Cache covers {len(cache.row_key_positions)} rows but {len(timestamps)} were supplied")
 
     row_to_packet = np.full(len(timestamps), -1, dtype=np.int64)
     row_to_packet[cache.key_dataset_indices] = np.arange(len(cache.key_dataset_indices), dtype=np.int64)
@@ -402,8 +404,16 @@ def resample_slow_cache(
             "resampling requires a cache extracted at a higher Slow rate"
         )
 
+    if cache.key_grid_timestamps is None:
+        raise ValueError(
+            "This Slow cache predates key_grid_timestamps, so resampling would add jitter on "
+            "top of the jitter it was extracted with. Re-extract it with scripts/extract_slow_cache.py."
+        )
+    # Jitter from the un-jittered lattice, never from the source cache's already
+    # jittered times: applying it twice sums two uniforms into a triangular
+    # distribution roughly twice as wide as the band that was requested.
     key_timestamps = jitter_key_timestamps(
-        cache.key_timestamps[selection],
+        cache.key_grid_timestamps[selection],
         jitter_s=jitter_s,
         rng=None if rng is None else np.random.default_rng(rng).integers(2**31 - 1),
     )
@@ -450,6 +460,7 @@ def resample_slow_cache(
         time_features=time_features,
         key_ready_delays=key_ready_delays,
         row_ready=row_ready,
+        key_grid_timestamps=cache.key_grid_timestamps[selection],
     )
 
 
@@ -513,13 +524,13 @@ def load_slow_cache(path: str | pathlib.Path, *, expected_rows: int | None = Non
         # Caches written before the timing contract was recorded fall back to the
         # defaults, which are the values those caches were generated with.
         scalars = {
-            name: float(cache[name])
-            for name in ("context_age_scale_s", "action_period_s")
-            if name in cache.files
+            name: float(cache[name]) for name in ("context_age_scale_s", "action_period_s") if name in cache.files
         }
         extra = {}
         if "row_ready" in cache.files:
             extra["row_ready"] = np.asarray(cache["row_ready"], dtype=np.bool_)
+        if "key_grid_timestamps" in cache.files:
+            extra["key_grid_timestamps"] = np.asarray(cache["key_grid_timestamps"], dtype=np.float64)
         if "key_ready_delays" in cache.files:
             extra["key_ready_delays"] = np.asarray(cache["key_ready_delays"], dtype=np.float64)
         elif "ready_delay_s" in cache.files:
@@ -544,6 +555,8 @@ def load_slow_cache(path: str | pathlib.Path, *, expected_rows: int | None = Non
         raise ValueError("All Slow packet arrays must have the same number of keys")
     if result.key_ready_delays is not None and len(result.key_ready_delays) != key_count:
         raise ValueError("key_ready_delays must have one latency per Slow packet")
+    if result.key_grid_timestamps is not None and len(result.key_grid_timestamps) != key_count:
+        raise ValueError("key_grid_timestamps must have one lattice time per Slow packet")
     if result.reference_actions.ndim != 3:
         raise ValueError(f"reference_actions must be [rows, chunk_steps, A], got {result.reference_actions.shape}")
     if len(result.reference_actions) != row_count or len(result.time_features) != row_count:

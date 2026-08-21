@@ -153,13 +153,20 @@ def test_absolute_command_undoes_normalization_before_rebasing():
     np.testing.assert_allclose(command[:, 1], 2.0)
 
 
-def _controller(cache, *, residual=None, residual_limit=None):
+def _controller(cache, *, residual=None, residual_limit=None, observer=None):
     residual = np.full((2, 6), 0.05, dtype=np.float32) if residual is None else residual
+
+    def predict(**kwargs):
+        if observer is not None:
+            observer(kwargs)
+        return residual, 1.0
+
     return slow_fast_loop.SlowFastController(
         cache=cache,
         force_buffer=_buffer(),
-        predict_residual=lambda **_: (residual, 1.0),
+        predict_residual=predict,
         normalize_state=lambda state: state,
+        normalize_force_history=lambda force: (force - 1.0) / 2.0,
         unnormalize_action=lambda action: action,
         config=slow_fast_loop.SlowFastConfig(
             action_period_s=0.1,
@@ -187,6 +194,52 @@ def test_controller_produces_an_absolute_command_from_reference_plus_residual():
     np.testing.assert_allclose(result["command_period_s"], 0.1)
     assert result["packet_version"] == 0
     np.testing.assert_allclose(result["context_age_s"], 0.05, atol=1e-9)
+
+
+def test_controller_normalizes_the_force_window_before_the_student_sees_it():
+    """The student was trained on normalized wrench; raw newtons pass every shape check."""
+    cache = slow_fast_runtime.SlowReferenceCache()
+    cache.update(_packet(state_at_observation=np.zeros(7)))
+    seen = {}
+
+    _controller(cache, observer=seen.update).step(1.0, np.zeros(7))
+
+    raw, _ = _buffer().window(1.0)
+    np.testing.assert_allclose(seen["force_history"], (raw - 1.0) / 2.0, atol=1e-6)
+    assert not np.allclose(seen["force_history"], raw)
+
+
+def test_controller_normalizes_masked_force_slots_the_way_training_does():
+    """Training fills invalid slots with zero and then normalizes, so they arrive as -mean/std."""
+    mean = np.arange(6, dtype=np.float32) + 1.0
+    std = np.full(6, 2.0, dtype=np.float32)
+    buffer = slow_fast_loop.ForceStreamBuffer(_history_transform())
+    buffer.append(0.0, np.zeros(6, dtype=np.float32))
+    cache = slow_fast_runtime.SlowReferenceCache()
+    cache.update(_packet(state_at_observation=np.zeros(7)))
+    seen = {}
+
+    def predict(**kwargs):
+        seen.update(kwargs)
+        return np.zeros((2, 6), dtype=np.float32), 1.0
+
+    slow_fast_loop.SlowFastController(
+        cache=cache,
+        force_buffer=buffer,
+        predict_residual=predict,
+        normalize_state=lambda state: state,
+        normalize_force_history=lambda force: (force - mean) / std,
+        unnormalize_action=lambda action: action,
+        config=slow_fast_loop.SlowFastConfig(
+            action_period_s=0.1, pose_dims=6, delta_dims=6, chunk_steps=2, max_staleness_s=0.25
+        ),
+    ).step(1.0, np.zeros(7, dtype=np.float32))
+
+    invalid = ~seen["force_history_mask"]
+    assert invalid.any(), "This test needs a window with stale slots to be meaningful"
+    np.testing.assert_allclose(
+        seen["force_history"][invalid], np.broadcast_to(-mean / std, (int(invalid.sum()), mean.size)), atol=1e-6
+    )
 
 
 def test_controller_clips_the_residual_to_the_configured_limit():

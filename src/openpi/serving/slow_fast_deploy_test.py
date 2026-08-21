@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pytest
 
+from openpi import transforms
 from openpi.policies import rotation_6d as rot
 from openpi.serving import slow_fast_deploy
 from openpi.training import fast_dataset
@@ -133,3 +134,36 @@ def test_converted_state_is_what_undoing_delta_actions_expects():
     np.testing.assert_allclose(state[:3], raw[:3], atol=1e-6)
     np.testing.assert_allclose(state[rot.POSE_DIMS], raw[6], atol=1e-6)
     np.testing.assert_allclose(rot.sixd_to_rpy(state[3 : rot.POSE_DIMS]), raw[3:6], atol=1e-5)
+
+
+def test_runtime_normalizers_reproduce_the_training_transform():
+    """Deployment reimplements Normalize; a drift here is a silent distribution shift."""
+    rng = np.random.default_rng(0)
+    stats = {
+        key: transforms.NormStats(mean=rng.normal(size=width), std=rng.uniform(0.5, 2.0, size=width))
+        for key, width in (("state", 32), ("actions", 32), ("force_history", 6))
+    }
+    normalizers = slow_fast_deploy.load_normalizers(stats)
+
+    state = rng.normal(size=rot.ROBOT_DIMS).astype(np.float32)
+    force = rng.normal(size=(10, 6)).astype(np.float32)
+    padded = np.concatenate([state, np.zeros(32 - rot.ROBOT_DIMS, dtype=np.float32)])
+    expected = transforms.Normalize(norm_stats=stats)({"state": padded, "force_history": force})
+
+    np.testing.assert_allclose(
+        normalizers["normalize_state"](state), expected["state"][: rot.ROBOT_DIMS], rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        normalizers["normalize_force_history"](force), expected["force_history"], rtol=1e-5, atol=1e-6
+    )
+
+    action = rng.normal(size=rot.ROBOT_DIMS).astype(np.float32)
+    normalized = (action - np.asarray(stats["actions"].mean)[: rot.ROBOT_DIMS]) / (
+        np.asarray(stats["actions"].std)[: rot.ROBOT_DIMS] + 1e-6
+    )
+    np.testing.assert_allclose(normalizers["unnormalize_action"](normalized), action, rtol=1e-5)
+
+
+def test_runtime_normalizers_reject_incomplete_norm_stats():
+    with pytest.raises(ValueError, match="force_history"):
+        slow_fast_deploy.load_normalizers({"state": transforms.NormStats(mean=np.zeros(3), std=np.ones(3))})

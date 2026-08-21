@@ -127,9 +127,13 @@ python scripts/extract_forcevla_paired_targets.py \
     --checkpoint=$CKPT --output-dir=artifacts/button_stage3_paired_targets/val
 ```
 
-**先看这一步的 summary 再往下走。** `full_vs_expert` 与 `null_vs_expert` 的相对差就是力条件带来的全部
-收益，也是 Fast 的信号上限。这个差只有个位数百分比的话，后面 Stage 4 能拿到的收益同样有限，值得先停下
-来查为什么力条件没起作用。
+**先看这一步的 summary 再往下走。** `normalized_full_vs_expert_mse` 与 `normalized_null_vs_expert_mse`
+的相对差就是力条件带来的全部收益，也是 Fast 的信号上限。这个差只有个位数百分比的话，后面 Stage 4 能拿
+到的收益同样有限，值得先停下来查为什么力条件没起作用。
+
+两个指标都按 `all` / `xyz` / `rotation_6d` / `gripper` 分组给出，且只统计前 10 个真实机器人维度——模型
+输出宽 32 维，其余 22 维是 padding，把它们平均进去会把误差和收益一起拉向 0。分组读法：力条件主要该体现
+在 `xyz` 和 `rotation_6d` 上；如果收益全落在 `gripper`，那不是接触控制的证据。
 
 ### 5. Slow cache
 
@@ -139,6 +143,9 @@ Slow 就是 Stage-2 Teacher 的 null 路径，不另训模型。只要 `--seed` 
 
 **train 必须 `--slow-rate-hz 0` 提全速率**，训练时才能重抽时序；val 保留一个固定实现作为不参与训练的
 时序。
+
+train cache 上的 `--update-jitter-ms` 不用管：cache 会同时存下未抖动的网格时间戳，训练每次重抽时序都从
+网格重新抽一次抖动，不会在 cache 已有的抖动上再叠一次。
 
 ```bash
 python scripts/extract_slow_cache.py \
@@ -190,7 +197,13 @@ python scripts/evaluate_fast_residual.py \
 ```
 
 同一条命令也会跑 force 消融（force history 置零 / 打乱），用来确认 Fast 不是只靠 Slow
-context/state/reference 猜 residual。省略 `--norm-stats-dir` 退化为 normalized-space、不分层的报告。
+context/state/reference 猜 residual。
+
+`--norm-stats-dir` 是必需的，不再可省。所有 pose 量都是相对 state 的 delta，而 Slow reference 的基准是它
+所属 packet 那一行的 state、Teacher 与 expert 的基准是当前行的 state；要把它们放在一起比，必须先各自反归
+一化再加回自己的物理 state，还原成绝对位姿。缺了 norm stats 做不到这一步，直接比 delta 就是拿两个不同原
+点的向量相减。测地线旋转误差同样只在绝对位姿上有意义：delta 的 6D 列模长接近 0，Gram–Schmidt 会把它正交
+化成一个与真实姿态无关的旋转矩阵，且不报错。
 
 重点看三项：
 
@@ -283,7 +296,7 @@ A_cmd[k, 9]  = A_ref(t + k·action_period)[9]      # gripper 由 Slow 独占
 cache 存在的唯一理由，是让 Fast 训练时看到的 packet 结构和运行时一致。
 
 `slow_fast_deploy` 固化了两边必须一致的东西：动作截到 `ROBOT_DIMS`、prefix pool 成相同 bin 数、state
-必须先转成 6D。
+必须先转成 6D、state 与 force history 都要按训练 norm stats 归一化。
 
 ```python
 from openpi.serving import slow_fast_deploy, slow_fast_loop, slow_fast_runtime
@@ -293,6 +306,8 @@ contract = slow_fast_deploy.load_contract(
     fast_run="checkpoints/button_press_fast_residual",  # 时序带来自训练 run，不是 cache
 )
 build_packet = slow_fast_deploy.SlowPacketBuilder(contract)
+# state 和 force history 都归一化；力传感器的原始牛顿值不能直接喂 Fast。
+normalizers = slow_fast_deploy.load_normalizers(data_config.norm_stats)
 
 def observe():
     timestamp, raw_state, images = read_robot()
@@ -301,12 +316,23 @@ def observe():
 def infer(observation):
     return build_packet(*teacher.sample_nominal_actions_and_context(rng, observation))
 
+cache = slow_fast_runtime.SlowReferenceCache()
 worker = slow_fast_loop.SlowWorker(
-    observe=observe, infer=infer, cache=slow_fast_runtime.SlowReferenceCache(),
+    observe=observe, infer=infer, cache=cache,
     config=contract.slow_fast_config(residual_limit=0.02),
     context_age_scale_s=contract.context_age_scale_s, period_s=0.1,
 )
+controller = slow_fast_loop.SlowFastController(
+    cache=cache, force_buffer=force_buffer, predict_residual=student,
+    unnormalize_action=normalizers["unnormalize_action"],
+    config=contract.slow_fast_config(residual_limit=0.02),
+    **{key: normalizers[key] for key in ("normalize_state", "normalize_force_history")},
+)
 ```
+
+`normalize_force_history` 是必填参数，没有默认值：Fast 是在归一化后的力上训的，直接喂原始牛顿值在偏置和
+量级上都错，但不会触发任何形状检查。归一化要作用在整个零填充窗口上、**不要**再乘 mask——训练侧是先填 0
+再归一化，所以无效 slot 到达模型时的值是 `-mean/std` 而不是 0。
 
 形状从 cache 的 summary 读，**时序带必须从 Fast 训练 run 的 `metadata.json` 读**——推荐的 train cache 是
 全速率提取的，它自己记录的带是退化的 `[0, 0]`。上机前用

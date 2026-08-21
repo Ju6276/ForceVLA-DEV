@@ -186,9 +186,16 @@ def _summarize(output_dir: pathlib.Path, ranges: list[tuple[int, int]], extracti
     timestamps = []
     residual_pose_l2 = []
     residual_first_pose_l2 = []
-    full_squared_error_sum = 0.0
-    null_squared_error_sum = 0.0
-    action_value_count = 0
+    # The model emits `action_dim` values but only the leading ROBOT_DIMS drive the
+    # robot; averaging the padded tail in dilutes every error toward zero and makes
+    # the force gain look smaller than it is.
+    groups = {
+        "all": slice(0, rot.ROBOT_DIMS),
+        "xyz": slice(0, rot.XYZ_DIMS),
+        "rotation_6d": slice(rot.XYZ_DIMS, rot.POSE_DIMS),
+        "gripper": slice(rot.POSE_DIMS, rot.ROBOT_DIMS),
+    }
+    squared_error = {name: {"full": 0.0, "null": 0.0, "count": 0} for name in groups}
     mask_valid = 0
     mask_count = 0
     for start, stop in ranges:
@@ -207,9 +214,11 @@ def _summarize(output_dir: pathlib.Path, ranges: list[tuple[int, int]], extracti
             expert = shard["normalized_expert_actions"]
             full = shard["normalized_full_actions"]
             null = shard["normalized_null_actions"]
-            full_squared_error_sum += float(np.sum(np.square(full - expert), dtype=np.float64))
-            null_squared_error_sum += float(np.sum(np.square(null - expert), dtype=np.float64))
-            action_value_count += expert.size
+            for name, dims in groups.items():
+                target = expert[..., dims]
+                squared_error[name]["full"] += float(np.sum(np.square(full[..., dims] - target), dtype=np.float64))
+                squared_error[name]["null"] += float(np.sum(np.square(null[..., dims] - target), dtype=np.float64))
+                squared_error[name]["count"] += target.size
             mask = shard["force_history_mask"]
             mask_valid += int(np.count_nonzero(mask))
             mask_count += mask.size
@@ -243,8 +252,13 @@ def _summarize(output_dir: pathlib.Path, ranges: list[tuple[int, int]], extracti
         "expected_rows": extraction_size,
         "complete": len(combined_indices) == extraction_size,
         "episodes": len(np.unique(combined_episodes)),
-        "normalized_full_vs_expert_mse": full_squared_error_sum / action_value_count if action_value_count else None,
-        "normalized_null_vs_expert_mse": null_squared_error_sum / action_value_count if action_value_count else None,
+        # Reported per group over the robot dimensions only; "all" is xyz+6D+gripper.
+        "normalized_full_vs_expert_mse": {
+            name: sums["full"] / sums["count"] if sums["count"] else None for name, sums in squared_error.items()
+        },
+        "normalized_null_vs_expert_mse": {
+            name: sums["null"] / sums["count"] if sums["count"] else None for name, sums in squared_error.items()
+        },
         "normalized_pose_residual_l2_all_horizon": distribution(residual_all),
         "normalized_pose_residual_l2_first_action": distribution(residual_first),
         "force_history_valid_fraction": mask_valid / mask_count if mask_count else None,

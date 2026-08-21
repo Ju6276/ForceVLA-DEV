@@ -179,14 +179,17 @@ def main() -> None:
     latency_range_s = tuple(value / 1000.0 for value in _band(args.slow_latency_ms, "--slow-latency-ms"))
     if min(slow_rate_range_hz) < 0:
         raise ValueError("Slow rate must be positive, or 0 for full-rate extraction")
-    if min(
-        args.action_rate_hz,
-        args.context_age_scale_ms,
-        args.context_tokens,
-        args.chunk_steps,
-        args.batch_size,
-        args.num_steps,
-    ) <= 0:
+    if (
+        min(
+            args.action_rate_hz,
+            args.context_age_scale_ms,
+            args.context_tokens,
+            args.chunk_steps,
+            args.batch_size,
+            args.num_steps,
+        )
+        <= 0
+    ):
         raise ValueError("All rates, dimensions, batch size, and flow steps must be positive")
 
     if min(latency_range_s) < 0 or args.update_jitter_ms < 0:
@@ -307,6 +310,9 @@ def main() -> None:
         "action_period_s": np.float64(1.0 / args.action_rate_hz),
         "key_ready_delays": key_ready_delays,
         "row_ready": row_ready,
+        # Kept alongside the jittered times so that a later resample redraws
+        # jitter from the lattice instead of stacking a second draw on top.
+        "key_grid_timestamps": stage3.timestamps[key_rows],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     _atomic_savez(args.output, arrays)
@@ -336,7 +342,9 @@ def main() -> None:
         ),
         "reference_vs_teacher_null_on_ready_rows_mse": float(
             np.mean(np.square(reference_actions[row_ready][..., : rot.POSE_DIMS] - null_pose[row_ready]))
-        ) if row_ready.any() else None,
+        )
+        if row_ready.any()
+        else None,
     }
     if row_ready.any():
         ages = stage3.timestamps[row_ready] - key_timestamps[ready_mapping[row_ready]]

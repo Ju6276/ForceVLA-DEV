@@ -33,6 +33,24 @@ def _pose_difference(prediction: np.ndarray, target: np.ndarray, *, physical: bo
     return np.asarray(prediction, dtype=np.float64) - np.asarray(target, dtype=np.float64)
 
 
+def to_absolute_pose(delta: np.ndarray, base_state: np.ndarray, action_stats, state_stats) -> np.ndarray:
+    """Rebase a normalized delta action onto its base state, in metres and radians.
+
+    This is the offline copy of `slow_fast_runtime.to_absolute_command`: unnormalize
+    first, then add the *physical* state, because `DeltaActions` runs before
+    `Normalize` in the training chain. Two things depend on getting this right.
+    The Slow reference is a delta from the state its packet was conditioned on while
+    the Teacher and expert are deltas from the current row's state, so subtracting
+    the deltas directly compares quantities with different origins. And the 6D
+    rotation columns only describe a rotation once the state is added back; a delta
+    on its own is a near-zero vector that `sixd_to_matrix` will happily
+    Gram-Schmidt into an arbitrary rotation.
+    """
+    physical = fast_dataset.denormalize(delta, action_stats, dims=rot.POSE_DIMS)
+    base = fast_dataset.denormalize(base_state[:, : rot.POSE_DIMS], state_stats, dims=rot.POSE_DIMS)
+    return (physical + base).astype(np.float32)
+
+
 def _load_model(checkpoint: pathlib.Path, *, chunk_steps: int):
     config = slow_fast.FastResidualConfig(chunk_steps=chunk_steps)
     model = slow_fast.FastStudentWithIntentProjector(config, slow_context_dim=2048, rngs=nnx.Rngs(0))
@@ -165,7 +183,9 @@ def _stratum_metrics(
     # The two mean squares do not add up to the total: the terms share A_null, so
     # there is a cross term. Compare their magnitudes; read `total_mse` for the sum.
     metrics["deployment_error_decomposition"] = {
-        "slow_term_mse": float(np.mean(np.square(reference[..., : poses["teacher_null"].shape[-1]] - poses["teacher_null"]))),
+        "slow_term_mse": float(
+            np.mean(np.square(reference[..., : poses["teacher_null"].shape[-1]] - poses["teacher_null"]))
+        ),
         "fast_term_mse": metrics["residual_vs_teacher_deviation"]["full"]["mse"],
         "total_mse": metrics["action_vs_teacher_full"]["slow_plus_full"]["mse"],
     }
@@ -251,12 +271,12 @@ def main() -> None:
     ready = np.flatnonzero(cache.row_ready) if cache.row_ready is not None else np.arange(len(arrays.dataset_indices))
     if len(ready) == 0:
         raise ValueError("Slow cache has no rows whose packet would already be ready")
+    # Kept before the row subset: the Slow reference is a delta from the state of
+    # its *key* row, which is generally not one of the rows being scored.
+    state_by_row = np.asarray(arrays.state)
     arrays = dataclasses.replace(
         arrays,
-        **{
-            field.name: getattr(arrays, field.name)[ready]
-            for field in dataclasses.fields(arrays)
-        },
+        **{field.name: getattr(arrays, field.name)[ready] for field in dataclasses.fields(arrays)},
     )
     cache = dataclasses.replace(
         cache,
@@ -270,71 +290,88 @@ def main() -> None:
     # Every step of the emitted chunk is scored, but the detailed pose report is on
     # step 0: that is the one that executes whenever Fast keeps up with the action rate.
     per_step_residual_mse = {
-        name: [float(np.mean(np.square(value[:, step] - arrays.residual_pose[:, step]))) for step in range(cache.chunk_steps)]
+        name: [
+            float(np.mean(np.square(value[:, step] - arrays.residual_pose[:, step])))
+            for step in range(cache.chunk_steps)
+        ]
         for name, value in chunk_predictions.items()
     }
     predictions = {name: value[:, 0] for name, value in chunk_predictions.items()}
 
-    poses = {
+    # Each delta is scored against the state it was produced from.
+    base_state = {
+        "reference": state_by_row[cache.key_dataset_indices[cache.row_key_positions]],
+        "teacher_full": arrays.state,
+        "teacher_null": arrays.state,
+        "expert": arrays.state,
+    }
+    deltas = {
         "reference": cache.reference_actions[:, 0, : rot.POSE_DIMS].astype(np.float32),
         "teacher_full": arrays.full_pose[:, 0],
         "teacher_null": arrays.null_pose[:, 0],
         "expert": arrays.expert_pose[:, 0],
     }
     residual_target = arrays.residual_pose[:, 0]
-    units = "normalized"
     contact_summary: dict = {"available": False}
     strata: dict[str, np.ndarray] = {}
 
-    norm_stats = None
-    if args.norm_stats_dir is not None and (args.norm_stats_dir / "norm_stats.json").is_file():
-        norm_stats = normalize_lib.load(args.norm_stats_dir)
-
-    if norm_stats is not None:
-        # Reporting in metres and radians is what makes the numbers actionable;
-        # normalized MSE cannot tell whether an error is safe on hardware.
-        action_stats = norm_stats["actions"]
-        poses = {name: fast_dataset.denormalize(value, action_stats, dims=rot.POSE_DIMS) for name, value in poses.items()}
-        scale = (np.asarray(action_stats.std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(np.float32)
-        predictions = {name: value * scale for name, value in predictions.items()}
-        residual_target = residual_target * scale
-        units = "physical"
-
-        wrench = fast_dataset.latest_physical_wrench(
-            arrays.force_history, arrays.force_history_mask, norm_stats["force_history"]
+    if args.norm_stats_dir is None or not (args.norm_stats_dir / "norm_stats.json").is_file():
+        raise ValueError(
+            f"--norm-stats-dir must point at a directory containing norm_stats.json (got {args.norm_stats_dir}). "
+            "Absolute poses cannot be reconstructed without it, and comparing raw normalized deltas would mix "
+            "the Slow packet's base state with the current row's."
         )
-        baseline = fast_dataset.episode_baseline_wrench(wrench, arrays.episode_indices, num_rows=args.baseline_rows)
-        magnitude = np.linalg.norm((wrench - baseline)[:, :3], axis=-1)
-        in_contact = magnitude >= args.contact_threshold_n
-        contact_summary = {
-            "available": True,
-            "criterion": "linear force deviation from the per-episode resting wrench",
-            "threshold_n": args.contact_threshold_n,
-            "baseline_rows": args.baseline_rows,
-            "contact_rows": int(np.count_nonzero(in_contact)),
-            "free_space_rows": int(np.count_nonzero(~in_contact)),
-            "raw_force_magnitude_n": {
-                "mean": float(np.mean(np.linalg.norm(wrench[:, :3], axis=-1))),
-                "p50": float(np.percentile(np.linalg.norm(wrench[:, :3], axis=-1), 50)),
-            },
-            "baseline_corrected_magnitude_n": {
-                "mean": float(np.mean(magnitude)),
-                "p50": float(np.percentile(magnitude, 50)),
-                "p95": float(np.percentile(magnitude, 95)),
-                "max": float(np.max(magnitude)),
-            },
-        }
-        if contact_summary["contact_rows"]:
-            strata["contact"] = in_contact
-        if contact_summary["free_space_rows"]:
-            strata["free_space"] = ~in_contact
+    norm_stats = normalize_lib.load(args.norm_stats_dir)
+    units = "physical"
+
+    # Reporting in metres and radians is what makes the numbers actionable;
+    # normalized MSE cannot tell whether an error is safe on hardware.
+    action_stats = norm_stats["actions"]
+    poses = {
+        name: to_absolute_pose(value, base_state[name], action_stats, norm_stats["state"])
+        for name, value in deltas.items()
+    }
+    # The residual is a difference of two deltas sharing one base, so it needs
+    # only the scale, not the offset.
+    scale = (np.asarray(action_stats.std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(np.float32)
+    predictions = {name: value * scale for name, value in predictions.items()}
+    residual_target = residual_target * scale
+
+    wrench = fast_dataset.latest_physical_wrench(
+        arrays.force_history, arrays.force_history_mask, norm_stats["force_history"]
+    )
+    baseline = fast_dataset.episode_baseline_wrench(wrench, arrays.episode_indices, num_rows=args.baseline_rows)
+    magnitude = np.linalg.norm((wrench - baseline)[:, :3], axis=-1)
+    in_contact = magnitude >= args.contact_threshold_n
+    contact_summary = {
+        "available": True,
+        "criterion": "linear force deviation from the per-episode resting wrench",
+        "threshold_n": args.contact_threshold_n,
+        "baseline_rows": args.baseline_rows,
+        "contact_rows": int(np.count_nonzero(in_contact)),
+        "free_space_rows": int(np.count_nonzero(~in_contact)),
+        "raw_force_magnitude_n": {
+            "mean": float(np.mean(np.linalg.norm(wrench[:, :3], axis=-1))),
+            "p50": float(np.percentile(np.linalg.norm(wrench[:, :3], axis=-1), 50)),
+        },
+        "baseline_corrected_magnitude_n": {
+            "mean": float(np.mean(magnitude)),
+            "p50": float(np.percentile(magnitude, 50)),
+            "p95": float(np.percentile(magnitude, 95)),
+            "max": float(np.max(magnitude)),
+        },
+    }
+    if contact_summary["contact_rows"]:
+        strata["contact"] = in_contact
+    if contact_summary["free_space_rows"]:
+        strata["free_space"] = ~in_contact
 
     metrics = {
         "rows": len(residual_target),
         "units": units,
         "chunk_steps": cache.chunk_steps,
         "per_step_residual_mse_normalized": per_step_residual_mse,
-        "norm_stats_dir": str(args.norm_stats_dir) if norm_stats is not None else None,
+        "norm_stats_dir": str(args.norm_stats_dir),
         "contact": contact_summary,
         "strata": {
             "all": _stratum_metrics(poses, predictions, residual_target, physical=units == "physical"),
