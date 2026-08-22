@@ -133,3 +133,50 @@ def test_nominal_context_sampling_forwards_the_row_keyed_noise():
     assert (actions, prefix, mask) == ("actions", "prefix", "mask")
     assert recorded["force_condition"] == "null"
     np.testing.assert_array_equal(recorded["noise"], noise)
+
+
+def test_standard_sampling_forwards_caller_supplied_noise():
+    config = pi0_force.Pi0_GuidanceConfig()
+    noise = jnp.arange(config.action_horizon * config.action_dim, dtype=jnp.float32).reshape(
+        1, config.action_horizon, config.action_dim
+    )
+    recorded = {}
+
+    class Stub:
+        force_condition = "full"
+        null_force_token = None
+        sample_actions_for_force_condition = pi0_force.Pi0_Guidance.sample_actions_for_force_condition
+
+        def _prepare_action_prefix(self, observation):
+            return "tokens", "mask", "prefix", "cache"
+
+        def _sample_actions_with_prefix(self, rng, observation, **kwargs):
+            recorded.update(kwargs)
+            return "actions"
+
+    actions = pi0_force.Pi0_Guidance.sample_actions(
+        Stub(), jax.random.key(0), config.fake_obs(batch_size=1), num_steps=4, noise=noise
+    )
+
+    assert actions == "actions"
+    assert recorded["force_condition"] == "full"
+    np.testing.assert_array_equal(recorded["noise"], noise)
+
+
+def test_button_instantaneous_baseline_matches_temporal_experiment_contract():
+    instantaneous = training_config.get_config("forcevla_button_instantaneous")
+    temporal = training_config.get_config("forcevla_button_temporal_100hz")
+    instantaneous_val = training_config.get_config("forcevla_button_instantaneous_val")
+    temporal_val = training_config.get_config("forcevla_button_temporal_100hz_val")
+
+    assert instantaneous.model.force_encoder.type == "instantaneous"
+    assert temporal.model.force_encoder.type == "tcn"
+    assert instantaneous.data.native_force_sidecar is None
+    assert temporal.data.native_force_sidecar is not None
+    assert instantaneous.data.base_config.episodes == temporal.data.base_config.episodes
+    assert instantaneous_val.data.base_config.episodes == temporal_val.data.base_config.episodes
+    assert instantaneous.num_train_steps == temporal.num_train_steps == 40_000
+    assert instantaneous.save_interval == temporal.save_interval == 20_000
+    assert instantaneous.batch_size == temporal.batch_size == 4
+    assert instantaneous.model.action_dim == temporal.model.action_dim
+    assert instantaneous.model.action_horizon == temporal.model.action_horizon

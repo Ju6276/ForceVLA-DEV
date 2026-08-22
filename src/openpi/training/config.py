@@ -1045,6 +1045,65 @@ _CONFIGS = [
         batch_size=4,
     ),
     TrainConfig(
+        name="forcevla_button_instantaneous",
+        project_name="forcevla",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(type="instantaneous"),
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="panda_button_press",
+            assets=AssetsConfig(asset_id="panda_button_press_instantaneous_train56"),
+            base_config=DataConfig(
+                episodes=_BUTTON_PRESS_TRAIN_EPISODES,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # Match the temporal Teacher exactly; the force front-end is the only
+        # experimental variable.
+        num_train_steps=40_000,
+        save_interval=20_000,
+        keep_period=20_000,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(type="instantaneous"),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
+    TrainConfig(
+        name="forcevla_button_instantaneous_val",
+        project_name="forcevla",
+        model=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(type="instantaneous"),
+        ),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="panda_button_press",
+            assets=AssetsConfig(
+                assets_dir="./assets/forcevla_button_instantaneous",
+                asset_id="panda_button_press_instantaneous_train56",
+            ),
+            base_config=DataConfig(
+                episodes=_BUTTON_PRESS_VAL_EPISODES,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=0,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            force_encoder=force_encoder.ForceEncoderConfig(type="instantaneous"),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
+    TrainConfig(
         name="forcevla_button_temporal_100hz",
         project_name="forcevla",
         model=pi0_force.Pi0_GuidanceConfig(

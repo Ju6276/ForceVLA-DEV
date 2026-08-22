@@ -444,12 +444,14 @@ class Pi0_Guidance(_model.BaseModel):
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Array | None = None,
     ) -> _model.Actions:
         return self.sample_actions_for_force_condition(
             rng,
             observation,
             force_condition=self.force_condition,
             num_steps=num_steps,
+            noise=noise,
         )
 
     def sample_actions_for_force_condition(
@@ -459,6 +461,7 @@ class Pi0_Guidance(_model.BaseModel):
         *,
         force_condition: typing.Literal["full", "null"],
         num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Array | None = None,
     ) -> _model.Actions:
         """Sample one explicit force condition for paired Teacher distillation."""
         if force_condition == "null" and self.null_force_token is None:
@@ -474,6 +477,7 @@ class Pi0_Guidance(_model.BaseModel):
             prefix_mask=prefix_mask,
             prefix_out_fix=prefix_out_fix,
             kv_cache=kv_cache,
+            noise=noise,
         )
 
     def sample_nominal_actions_and_context(

@@ -16,12 +16,9 @@ Stage 4  Intent Projector + Fast force residual student
 
 ## 状态
 
-**没有任何已训练产物。** checkpoint、norm stats、Stage-3 targets、Slow cache 全部已删除，USB 与 Button
-两条线都要从 Stage 1 重跑。末端姿态改为 6D 连续旋转后归一化统计必须重算，旧 checkpoint 的输入输出布局
-也不再兼容，保留它们只会误导。
-
-Slow/Fast 这条线在 2026-08-21 改过 6D 旋转、时序随机化、K 步 chunk 和部署契约。这些改动只有单元测试和
-合成数据 smoke 验证过，**没有跑过真实训练或真机**。
+Button 的 Temporal Stage 1（40k）、Stage 2（10k）、Stage-3 targets、Slow cache 和 Fast Student（10k）
+已经完成一次真实离线流程；尚未做真机验证。正在补与 Temporal 完全同 split、动作表示和训练 schedule 的
+instantaneous ForceVLA 40k 公平基线。旧的 Euler-angle checkpoint 不兼容当前 6D 连续旋转布局，不应复用。
 
 `assets/`、`checkpoints/`、`artifacts/`、`wandb/`、`data/` 均被 Git 忽略，仓库里只有代码。
 
@@ -84,6 +81,7 @@ Stage 2 各一份；val config 显式指向 Stage 1 的目录，不需要自己�
 
 ```bash
 python scripts/compute_norm_stats.py --config-name forcevla_button_temporal_100hz
+python scripts/compute_norm_stats.py --config-name forcevla_button_instantaneous
 
 SRC=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56
 mkdir -p assets/forcevla_button_temporal_stage2_null_bc
@@ -97,6 +95,39 @@ WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_button_temporal_100hz \
     --exp-name=button_press_temporal_100hz --overwrite --batch_size=4
 ```
+
+### 2b. Stage 1 对照：instantaneous ForceVLA
+
+这是原 ForceVLA 的当前 6D wrench 前端 `state[10:16] → Linear(6, 2048)`，不读取高频 sidecar。除 force
+encoder 外，它与上面的 Temporal Teacher 使用相同 56/10 split、Pi0 base 权重、6D action、LoRA/freeze
+filter、batch size、40k steps 和 20k 保存间隔。
+
+```bash
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+python scripts/train.py forcevla_button_instantaneous \
+    --exp-name=button_press_instantaneous_40k --overwrite --batch_size=4
+```
+
+训练完成后，用同一验证 split 和按 dataset row 固定的 flow noise 分别评估，避免两次采样噪声不同：
+
+```bash
+python scripts/evaluate_forcevla_checkpoint.py \
+    --config-name=forcevla_button_instantaneous \
+    --data-config-name=forcevla_button_instantaneous_val \
+    --checkpoint=checkpoints/forcevla_button_instantaneous/button_press_instantaneous_40k/39999 \
+    --output-dir=artifacts/button_stage1_evaluation/instantaneous \
+    --contact-sidecar-dir=data/panda_button_press_100hz_causal/raw_sidecars
+
+python scripts/evaluate_forcevla_checkpoint.py \
+    --config-name=forcevla_button_temporal_100hz \
+    --data-config-name=forcevla_button_temporal_100hz_val \
+    --checkpoint=checkpoints/forcevla_button_temporal_100hz/button_press_temporal_100hz/39999 \
+    --output-dir=artifacts/button_stage1_evaluation/temporal \
+    --contact-sidecar-dir=data/panda_button_press_100hz_causal/raw_sidecars
+```
+
+评估器同时报告 normalized action MSE、物理平移 RMSE（米）、SO(3) 测地线旋转 RMSE（弧度）和 gripper
+误差，并按同一高频 sidecar 划分 contact / free-space。它不把米、弧度和 6D 坐标混成一个 pose MSE。
 
 ### 3. Stage 2：null-force adaptation
 
@@ -389,13 +420,11 @@ worker 随后装入 packet 是正常的读序，不是错误——只在两个�
 | `forcevla_temporal_lora_aligned` | 发布数据的 30 Hz temporal compatibility baseline |
 | `forcevla_usb_lora` | USB instantaneous 40k baseline |
 | `forcevla_usb_temporal_lora_aligned` | USB 30 Hz Temporal Teacher |
+| `forcevla_button_instantaneous` | Button instantaneous 40k 公平基线 |
+| `forcevla_button_instantaneous_val` | Button instantaneous held-out loader |
 | `forcevla_button_temporal_100hz` | Button Stage 1，100 Hz 力 |
 | `forcevla_button_temporal_100hz_val` | Button held-out loader |
 | `forcevla_button_temporal_stage2_null_bc` | Button Stage 2 |
-
-TODO（暂不实现）：增加与 Button temporal 完全相同数据划分、6D pose 表示和训练 schedule 的 Button
-instantaneous 配置，用于受控 Stage-1 对比。用户确认开始该实验时再添加，当前不阻塞 temporal/slow-fast
-流程。
 
 `forcevla_lora` / `forcevla_usb_lora` 始终是 instantaneous baseline，训练 temporal 模型必须显式选 temporal
 config。这些 LoRA config 沿用 OpenPI/ForceVLA 的 freeze filter：Gemma 主权重冻结，LoRA 参数、视觉编码器
@@ -404,6 +433,6 @@ project 均为 `forcevla`。
 
 ## 尚未证明的事
 
-本仓库不宣称 Temporal 优于 Instantaneous，也不宣称非零的 `A_full - A_null` 已经证明了有效的 slow/fast
-控制分解。Slow/Fast 这条线目前只有单元测试和合成数据 smoke，没有真实训练结果。结论必须来自 held-out
-与在线机器人实验。
+本仓库尚不宣称 Temporal 优于 Instantaneous；必须等上面的公平 baseline 完成 held-out 对比。非零的
+`A_full - A_null` 本身也不等于已证明有效控制分解。当前 Slow/Fast 有真实离线 held-out 结果，但最终结论仍
+需要真机实验。
