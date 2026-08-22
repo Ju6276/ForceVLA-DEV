@@ -355,6 +355,14 @@ class Pi0_Guidance(_model.BaseModel):
             return self.force_in_proj(obs.state[:, 10:16])
         if obs.force_history is None or obs.force_history_mask is None:
             raise ValueError(f"force_history and force_history_mask are required for {encoder_type!r} mode")
+        if encoder_type == "native_instantaneous":
+            # The final fixed-rate slot is the newest timestamp-causal sample
+            # for the current VLA observation time. Mask it after normalization
+            # so a missing/stale current sample becomes neutral zero input. This
+            # deliberately reuses the original ForceVLA Linear(6 -> width).
+            current_force = obs.force_history[:, -1]
+            current_valid = obs.force_history_mask[:, -1, None].astype(current_force.dtype)
+            return self.force_in_proj(current_force * current_valid)
         assert self.temporal_force_encoder is not None
         return self.temporal_force_encoder(obs.force_history, obs.force_history_mask, train=train)
 

@@ -88,6 +88,9 @@ mkdir -p assets/forcevla_button_temporal_stage2_null_bc
 cp -r "$SRC" assets/forcevla_button_temporal_stage2_null_bc/
 ```
 
+`forcevla_button_native_instantaneous_100hz` 故意直接复用 Temporal 的 train56 norm stats，保证它和 TCN
+看到的 sidecar wrench 使用完全相同的归一化；不要为它单独重算统计量。
+
 ### 2. Stage 1：Temporal Teacher
 
 ```bash
@@ -107,6 +110,40 @@ WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_button_instantaneous \
     --exp-name=button_press_instantaneous_40k --overwrite --batch_size=4
 ```
+
+### 2c. Stage 1 严格对照：native instantaneous（已配置，按需启动）
+
+这个配置与 Temporal 使用同一份100 Hz timestamp sidecar、同一个 `(t-100 ms, t]` 的 `10×6` 因果窗口、
+12 ms freshness mask 和同一份 train56 norm stats，但只读取窗口最后的当前槽位：
+
+```text
+latest causal 6D wrench at t -> original force_in_proj Linear(6, 2048) -> one force token
+```
+
+其余9个历史槽位不进入网络，也不创建 TCN。这样 `native_instantaneous` 与 Temporal TCN 的差异只剩
+“当前单点”还是“100 ms历史编码”。以下命令只供准备好后启动，目前不需要运行：
+
+```bash
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+python scripts/train.py forcevla_button_native_instantaneous_100hz \
+    --exp-name=button_press_native_instantaneous_100hz_40k --overwrite --batch_size=4
+```
+
+训练结束后的同口径评估命令是：
+
+```bash
+python scripts/evaluate_forcevla_checkpoint.py \
+    --config-name=forcevla_button_native_instantaneous_100hz \
+    --data-config-name=forcevla_button_native_instantaneous_100hz_val \
+    --checkpoint=checkpoints/forcevla_button_native_instantaneous_100hz/button_press_native_instantaneous_100hz_40k/39999 \
+    --output-dir=artifacts/button_stage1_evaluation/native_instantaneous \
+    --contact-sidecar-dir=data/panda_button_press_100hz_causal/raw_sidecars
+```
+
+三组结果应按下面的顺序解释：
+
+- 原版30 Hz instantaneous vs native instantaneous：力数据源、采样与时间戳对齐的影响。
+- native instantaneous vs Temporal TCN：在相同高频数据源下，历史编码本身的影响。
 
 训练完成后，用同一验证 split 和按 dataset row 固定的 flow noise 分别评估，避免两次采样噪声不同：
 
@@ -422,6 +459,8 @@ worker 随后装入 packet 是正常的读序，不是错误——只在两个�
 | `forcevla_usb_temporal_lora_aligned` | USB 30 Hz Temporal Teacher |
 | `forcevla_button_instantaneous` | Button instantaneous 40k 公平基线 |
 | `forcevla_button_instantaneous_val` | Button instantaneous held-out loader |
+| `forcevla_button_native_instantaneous_100hz` | Button 同源100 Hz最新单点力40k对照 |
+| `forcevla_button_native_instantaneous_100hz_val` | Button 同源最新单点力 held-out loader |
 | `forcevla_button_temporal_100hz` | Button Stage 1，100 Hz 力 |
 | `forcevla_button_temporal_100hz_val` | Button held-out loader |
 | `forcevla_button_temporal_stage2_null_bc` | Button Stage 2 |

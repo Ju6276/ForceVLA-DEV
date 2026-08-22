@@ -29,6 +29,34 @@ def test_null_force_token_is_broadcast_across_batch():
     np.testing.assert_array_equal(encoded, np.tile(np.arange(4, dtype=np.float32), (3, 1)))
 
 
+def test_native_instantaneous_uses_only_the_current_causal_slot_and_original_projection():
+    model = SimpleNamespace(
+        force_condition="full",
+        force_encoder_config=SimpleNamespace(type="native_instantaneous"),
+        force_in_proj=lambda force: force * 2,
+        temporal_force_encoder=None,
+    )
+    history = jnp.asarray(
+        [
+            [[1, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2], [3, 3, 3, 3, 3, 3]],
+            [[4, 4, 4, 4, 4, 4], [5, 5, 5, 5, 5, 5], [6, 6, 6, 6, 6, 6]],
+        ],
+        dtype=jnp.float32,
+    )
+    observation = SimpleNamespace(
+        state=jnp.zeros((2, 32), dtype=jnp.float32),
+        force_history=history,
+        # The second row has valid history, but no fresh sample in the current
+        # timestamp slot. It must not silently fall back to an older force.
+        force_history_mask=jnp.asarray([[True, True, True], [True, True, False]]),
+    )
+
+    encoded = pi0_force.Pi0_Guidance.encode_force(model, observation)
+
+    np.testing.assert_array_equal(encoded[0], np.full(6, 6, dtype=np.float32))
+    np.testing.assert_array_equal(encoded[1], np.zeros(6, dtype=np.float32))
+
+
 def test_stage1_checkpoint_can_initialize_selected_stage2_parameters():
     loaded = {
         "teacher": {"weight": np.ones((2,), dtype=np.float32)},
@@ -180,3 +208,26 @@ def test_button_instantaneous_baseline_matches_temporal_experiment_contract():
     assert instantaneous.batch_size == temporal.batch_size == 4
     assert instantaneous.model.action_dim == temporal.model.action_dim
     assert instantaneous.model.action_horizon == temporal.model.action_horizon
+
+
+def test_button_native_instantaneous_is_a_history_only_control_for_temporal():
+    native = training_config.get_config("forcevla_button_native_instantaneous_100hz")
+    native_val = training_config.get_config("forcevla_button_native_instantaneous_100hz_val")
+    temporal = training_config.get_config("forcevla_button_temporal_100hz")
+    temporal_val = training_config.get_config("forcevla_button_temporal_100hz_val")
+
+    assert native.model.force_encoder.type == "native_instantaneous"
+    assert native.model.force_encoder.max_history_samples == temporal.model.force_encoder.max_history_samples == 10
+    assert native.model.force_encoder.sampling_rate_hz == temporal.model.force_encoder.sampling_rate_hz == 100
+    assert native.model.force_encoder.window_ms == temporal.model.force_encoder.window_ms == 100
+    assert native.model.force_encoder.max_sample_age_ms == temporal.model.force_encoder.max_sample_age_ms == 12
+    assert native.data.native_force_sidecar == temporal.data.native_force_sidecar
+    assert native_val.data.native_force_sidecar == temporal_val.data.native_force_sidecar
+    assert native.data.base_config.episodes == temporal.data.base_config.episodes
+    assert native_val.data.base_config.episodes == temporal_val.data.base_config.episodes
+    assert native.data.assets == temporal_val.data.assets
+    assert native_val.data.assets == temporal_val.data.assets
+    assert native.num_train_steps == temporal.num_train_steps == 40_000
+    assert native.save_interval == temporal.save_interval == 20_000
+    assert native.keep_period == temporal.keep_period == 20_000
+    assert native.batch_size == temporal.batch_size == 4

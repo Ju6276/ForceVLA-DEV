@@ -26,7 +26,7 @@ class ForceEncoderConfig:
     history_source: str = "timestamp_stream"
 
     def __post_init__(self):
-        if self.type not in {"instantaneous", "tcn"}:
+        if self.type not in {"instantaneous", "native_instantaneous", "tcn"}:
             raise ValueError(f"Unknown force encoder type: {self.type}")
         if self.aggregation not in {"last", "mean"}:
             raise ValueError(f"Unknown temporal aggregation: {self.aggregation}")
