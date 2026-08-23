@@ -47,19 +47,34 @@ def to_absolute_pose(delta: np.ndarray, base_state: np.ndarray, action_stats, st
 
 
 def _load_model(checkpoint: pathlib.Path, *, chunk_steps: int):
-    config = slow_fast.FastResidualConfig(chunk_steps=chunk_steps)
-    model = slow_fast.FastStudentWithIntentProjector(config, slow_context_dim=2048, rngs=nnx.Rngs(0))
+    """Rebuild the student, taking the head layout from the checkpoint itself.
+
+    Whether a run has a staleness head is not something the caller should have to
+    remember: a single-head checkpoint loaded into a two-head module would silently
+    leave the staleness projection at its zero initialization and report the run as
+    if it had simply learned nothing there.
+    """
     params = model_lib.restore_params(checkpoint)
+    predicts_staleness = "staleness_head" in params.get("fast_student", {})
+    config = slow_fast.FastResidualConfig(chunk_steps=chunk_steps, predict_staleness=predicts_staleness)
+    model = slow_fast.FastStudentWithIntentProjector(config, slow_context_dim=2048, rngs=nnx.Rngs(0))
     state = nnx.state(model, nnx.Param)
     state.replace_by_pure_dict(params)
     nnx.update(model, state)
-    return model
+    return model, predicts_staleness
 
 
-def _predict_all(model, arrays, cache, *, batch_size: int, seed: int) -> dict[str, np.ndarray]:
+def _predict_all(model, arrays, cache, *, batch_size: int, seed: int):
+    """Run the student under the force ablations, keeping both heads separate.
+
+    The staleness head is collected under the same ablations even though it cannot
+    see force. Its outputs must then be bit-identical across them, which is the
+    cheapest available check that the force token really is masked out of it.
+    """
+
     @nnx.jit
     def infer(module, context, context_mask, force, force_mask, state, reference, time_features):
-        residual, _, _ = module(
+        residual, staleness, _, _ = module(
             context,
             context_mask,
             force,
@@ -69,10 +84,11 @@ def _predict_all(model, arrays, cache, *, batch_size: int, seed: int) -> dict[st
             time_features,
             train=False,
         )
-        return residual
+        return residual, staleness
 
     permutation = np.random.default_rng(seed).permutation(len(arrays.dataset_indices))
     predictions: dict[str, list[np.ndarray]] = {"full": [], "zero_force": [], "shuffled_force": []}
+    staleness_parts: dict[str, list[np.ndarray]] = {"full": [], "zero_force": [], "shuffled_force": []}
     for start in range(0, len(arrays.dataset_indices), batch_size):
         indices = np.arange(start, min(start + batch_size, len(arrays.dataset_indices)))
         key_positions = cache.row_key_positions[indices]
@@ -87,21 +103,27 @@ def _predict_all(model, arrays, cache, *, batch_size: int, seed: int) -> dict[st
             jnp.asarray(cache.reference_actions[indices, 0], dtype=jnp.float32),
             jnp.asarray(cache.time_features[indices], dtype=jnp.float32),
         )
-        predictions["full"].append(np.asarray(infer(model, *common, force, force_mask, *suffix)))
-        predictions["zero_force"].append(np.asarray(infer(model, *common, jnp.zeros_like(force), force_mask, *suffix)))
         shuffled = permutation[indices]
-        predictions["shuffled_force"].append(
-            np.asarray(
-                infer(
-                    model,
-                    *common,
-                    jnp.asarray(arrays.force_history[shuffled], dtype=jnp.float32),
-                    jnp.asarray(arrays.force_history_mask[shuffled], dtype=jnp.bool_),
-                    *suffix,
-                )
-            )
-        )
-    return {name: np.concatenate(parts) for name, parts in predictions.items()}
+        variants = {
+            "full": (force, force_mask),
+            "zero_force": (jnp.zeros_like(force), force_mask),
+            "shuffled_force": (
+                jnp.asarray(arrays.force_history[shuffled], dtype=jnp.float32),
+                jnp.asarray(arrays.force_history_mask[shuffled], dtype=jnp.bool_),
+            ),
+        }
+        for name, (variant_force, variant_mask) in variants.items():
+            residual, staleness = infer(model, *common, variant_force, variant_mask, *suffix)
+            predictions[name].append(np.asarray(residual))
+            if staleness is not None:
+                staleness_parts[name].append(np.asarray(staleness))
+    residuals = {name: np.concatenate(parts) for name, parts in predictions.items()}
+    staleness = (
+        {name: np.concatenate(parts) for name, parts in staleness_parts.items()}
+        if staleness_parts["full"]
+        else None
+    )
+    return residuals, staleness
 
 
 def physical_pose_error_summary(prediction: np.ndarray, target: np.ndarray) -> dict:
@@ -133,8 +155,18 @@ def _stratum_metrics(
     physical_predictions: dict[str, np.ndarray],
     normalized_predictions: dict[str, np.ndarray],
     normalized_residual_target: np.ndarray,
+    *,
+    normalized_staleness: np.ndarray | None = None,
+    physical_staleness: np.ndarray | None = None,
+    normalized_staleness_target: np.ndarray | None = None,
 ) -> dict:
-    """Compare every variant against both the Teacher and the true expert."""
+    """Compare every variant against both the Teacher and the true expert.
+
+    The staleness correction enters every commanded action, since it is what the robot
+    executes, but it is scored on its own target. Folding it into the force numbers
+    would make the force ablations look better than they are: it improves the command
+    without knowing anything about contact.
+    """
     reference = poses["reference"]
     metrics: dict = {
         "rows": len(reference),
@@ -151,9 +183,21 @@ def _stratum_metrics(
             "teacher_null": physical_pose_error_summary(poses["teacher_null"], poses["expert"]),
         },
     }
+    if normalized_staleness is not None:
+        staleness_baseline = float(np.mean(np.square(normalized_staleness_target)))
+        staleness_mse = float(np.mean(np.square(normalized_staleness - normalized_staleness_target)))
+        metrics["staleness_vs_reference_drift"] = {
+            "space": "normalized pose residual",
+            "zero_staleness_baseline_mse_normalized": staleness_baseline,
+            "mse_normalized": staleness_mse,
+            "predicted_l2_mean_normalized": float(np.mean(np.linalg.norm(normalized_staleness, axis=-1))),
+            "gain_vs_zero_staleness": 1.0 - staleness_mse / max(staleness_baseline, 1e-12),
+        }
     baseline = metrics["residual_vs_teacher_deviation"]["zero_residual_baseline_mse_normalized"]
     for name, normalized_prediction in normalized_predictions.items():
         commanded = reference + physical_predictions[name]
+        if physical_staleness is not None:
+            commanded = commanded + physical_staleness
         metrics["residual_vs_teacher_deviation"][name] = {
             "mse_normalized": float(np.mean(np.square(normalized_prediction - normalized_residual_target))),
             "predicted_l2_mean_normalized": float(np.mean(np.linalg.norm(normalized_prediction, axis=-1))),
@@ -184,6 +228,10 @@ def _stratum_metrics(
         ],
         "composed_vs_teacher_full_physical": metrics["action_vs_teacher_full"]["slow_plus_full"],
     }
+    if normalized_staleness is not None:
+        metrics["deployment_error_decomposition"]["fast_staleness_vs_reference_drift_mse_normalized"] = metrics[
+            "staleness_vs_reference_drift"
+        ]["mse_normalized"]
     metrics["action_vs_expert"]["teacher_force_gain"] = {
         key: 1.0
         - metrics["action_vs_expert"]["teacher_full"][key]
@@ -228,6 +276,13 @@ def _print_report(metrics: dict) -> None:
             print(
                 f"    {name:<22} mse={residual[name]['mse_normalized']:.6f}  "
                 f"gain={residual[name]['gain_vs_zero_residual']:.4f}"
+            )
+        drift = values.get("staleness_vs_reference_drift")
+        if drift is not None:
+            print(
+                "  Stale-reference drift recovery, normalized "
+                f"(zero baseline={drift['zero_staleness_baseline_mse_normalized']:.6f}): "
+                f"mse={drift['mse_normalized']:.6f}  gain={drift['gain_vs_zero_staleness']:.4f}"
             )
 
 
@@ -285,6 +340,49 @@ def main() -> None:
     baseline_by_row = fast_dataset.episode_baseline_wrench(
         wrench_by_row, arrays.episode_indices, num_rows=args.baseline_rows
     )
+    model, predicts_staleness = _load_model(args.checkpoint.resolve(), chunk_steps=cache.chunk_steps)
+    metrics = evaluate(
+        model,
+        arrays,
+        cache,
+        norm_stats,
+        wrench_by_row,
+        baseline_by_row,
+        predicts_staleness=predicts_staleness,
+        contact_threshold_n=args.contact_threshold_n,
+        baseline_rows=args.baseline_rows,
+        batch_size=args.batch_size,
+        seed=args.seed,
+    )
+    metrics["norm_stats_dir"] = str(args.norm_stats_dir)
+
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(metrics, indent=2))
+    print(json.dumps(metrics, indent=2))
+    _print_report(metrics)
+
+
+def evaluate(
+    model,
+    arrays,
+    cache,
+    norm_stats,
+    wrench_by_row,
+    baseline_by_row,
+    *,
+    predicts_staleness: bool,
+    contact_threshold_n: float,
+    baseline_rows: int,
+    batch_size: int = 256,
+    seed: int = 0,
+) -> dict:
+    """Score one timing realization of the Slow cache.
+
+    Split out of `main` so a timing sweep can reuse it: the whole point of the sweep
+    is that every operating point is scored by exactly this code, and a second copy
+    of the metric pipeline would make the curve incomparable to the single-point run.
+    """
     ready = np.flatnonzero(cache.row_ready) if cache.row_ready is not None else np.arange(len(arrays.dataset_indices))
     if len(ready) == 0:
         raise ValueError("Slow cache has no rows whose packet would already be ready")
@@ -302,8 +400,7 @@ def main() -> None:
         row_key_positions=cache.row_key_positions[ready],
         row_ready=np.ones(len(ready), dtype=bool) if cache.row_ready is not None else None,
     )
-    model = _load_model(args.checkpoint.resolve(), chunk_steps=cache.chunk_steps)
-    chunk_predictions = _predict_all(model, arrays, cache, batch_size=args.batch_size, seed=args.seed)
+    chunk_predictions, chunk_staleness = _predict_all(model, arrays, cache, batch_size=batch_size, seed=seed)
     # Every step of the emitted chunk is scored, but the detailed pose report is on
     # step 0: that is the one that executes whenever Fast keeps up with the action rate.
     per_step_residual_mse = {
@@ -314,6 +411,15 @@ def main() -> None:
         for name, value in chunk_predictions.items()
     }
     normalized_predictions = {name: value[:, 0] for name, value in chunk_predictions.items()}
+    normalized_staleness = None if chunk_staleness is None else chunk_staleness["full"][:, 0]
+    force_blindness_deviation = (
+        None
+        if chunk_staleness is None
+        else max(
+            float(np.max(np.abs(chunk_staleness[name] - chunk_staleness["full"])))
+            for name in ("zero_force", "shuffled_force")
+        )
+    )
 
     # Each delta is scored against the state it was produced from.
     base_state = {
@@ -343,16 +449,33 @@ def main() -> None:
     # only the scale, not the offset.
     scale = (np.asarray(action_stats.std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(np.float32)
     physical_predictions = {name: value * scale for name, value in normalized_predictions.items()}
+    physical_staleness = None if normalized_staleness is None else normalized_staleness * scale
+    normalized_staleness_target = None
+    if normalized_staleness is not None:
+        # The reference is a delta from its own key row's state, so the drift is not
+        # `A_null - A_ref`: that difference is missing the base-state gap between the
+        # two rows, which on the rotation coordinates is as large as the drift itself.
+        state_scale = (np.asarray(norm_stats["state"].std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(
+            np.float32
+        )
+        base_gap = arrays.state[:, : rot.POSE_DIMS] - state_by_row[cache.key_dataset_indices[cache.row_key_positions]][
+            :, : rot.POSE_DIMS
+        ]
+        normalized_staleness_target = (
+            arrays.null_pose[:, 0]
+            - cache.reference_actions[:, 0, : rot.POSE_DIMS].astype(np.float32)
+            + (state_scale / scale) * base_gap
+        )
 
     wrench = wrench_by_row[ready]
     baseline = baseline_by_row[ready]
     magnitude = np.linalg.norm((wrench - baseline)[:, :3], axis=-1)
-    in_contact = magnitude >= args.contact_threshold_n
+    in_contact = magnitude >= contact_threshold_n
     contact_summary = {
         "available": True,
         "criterion": "linear force deviation from the per-episode resting wrench",
-        "threshold_n": args.contact_threshold_n,
-        "baseline_rows": args.baseline_rows,
+        "threshold_n": contact_threshold_n,
+        "baseline_rows": baseline_rows,
         "contact_rows": int(np.count_nonzero(in_contact)),
         "free_space_rows": int(np.count_nonzero(~in_contact)),
         "raw_force_magnitude_n": {
@@ -377,7 +500,10 @@ def main() -> None:
         "residual_mse_space": "normalized_pose_residual",
         "chunk_steps": cache.chunk_steps,
         "per_step_residual_mse_normalized": per_step_residual_mse,
-        "norm_stats_dir": str(args.norm_stats_dir),
+        "predicts_staleness": predicts_staleness,
+        # Must be exactly zero: the staleness head is evaluated under force ablations
+        # it structurally cannot see. Anything else means the force token is reaching it.
+        "staleness_force_blindness_max_deviation": force_blindness_deviation,
         "contact": contact_summary,
         "strata": {
             "all": _stratum_metrics(
@@ -385,6 +511,9 @@ def main() -> None:
                 physical_predictions,
                 normalized_predictions,
                 normalized_residual_target,
+                normalized_staleness=normalized_staleness,
+                physical_staleness=physical_staleness,
+                normalized_staleness_target=normalized_staleness_target,
             ),
             **{
                 name: _stratum_metrics(
@@ -392,17 +521,17 @@ def main() -> None:
                     {key: value[selector] for key, value in physical_predictions.items()},
                     {key: value[selector] for key, value in normalized_predictions.items()},
                     normalized_residual_target[selector],
+                    normalized_staleness=None if normalized_staleness is None else normalized_staleness[selector],
+                    physical_staleness=None if physical_staleness is None else physical_staleness[selector],
+                    normalized_staleness_target=(
+                        None if normalized_staleness_target is None else normalized_staleness_target[selector]
+                    ),
                 )
                 for name, selector in strata.items()
             },
         },
     }
-
-    if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(metrics, indent=2))
-    print(json.dumps(metrics, indent=2))
-    _print_report(metrics)
+    return metrics
 
 
 if __name__ == "__main__":

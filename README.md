@@ -243,9 +243,11 @@ python scripts/train_fast_residual.py \
     --val-targets=artifacts/button_stage3_paired_targets/val \
     --train-slow-cache=artifacts/button_slow_cache/train.npz \
     --val-slow-cache=artifacts/button_slow_cache/val.npz \
+    --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
     --output-dir=checkpoints/button_press_fast_residual \
     --steps=10000 --batch-size=64 \
-    --chunk-steps=5 --timing-resample-interval=500
+    --chunk-steps=5 --timing-resample-interval=500 \
+    --staleness-weight=1.0
 ```
 
 W&B 的 `timing/*` 记录每次重抽后的 `ready_row_fraction`、`mean_normalized_age` 和
@@ -264,8 +266,11 @@ python scripts/evaluate_fast_residual.py \
     --output=artifacts/button_fast_evaluation/val.json
 ```
 
-同一条命令也会跑 force 消融（force history 置零 / 打乱），用来确认 Fast 不是只靠 Slow
-context/state/reference 猜 residual。
+同一条命令也会跑 force 消融（force history 置零 / 打乱），用来确认力头不是只靠 Slow
+context/state/reference 猜 residual。消融只改变力头的输出：staleness head 的输出在三种情形下必须逐位相同，
+`staleness_force_blindness_max_deviation` 报告最大偏差，不为 0 说明 force token 泄漏进了陈旧头。
+
+head 布局从 checkpoint 自己读，不用手动指定：单头的旧 checkpoint 仍可直接评估，只是不报 staleness 项。
 
 `--norm-stats-dir` 是必需的，不再可省。所有 pose 量都是相对 state 的 delta，而 Slow reference 的基准是它
 所属 packet 那一行的 state、Teacher 与 expert 的基准是当前行的 state；要把它们放在一起比，必须先各自反归
@@ -276,8 +281,9 @@ context/state/reference 猜 residual。
 重点看三项：
 
 - `deployment_error_decomposition`：Slow 与总组合误差分别报告物理平移 RMSE（米）和 SO(3) 测地线旋转
-  RMSE（弧度）；Fast 项报告它实际优化的 normalized residual MSE。三者单位不同，不能相加，只用于定位误差
-  来自 Slow reference、Fast residual，还是最终组合。
+  RMSE（弧度）；两个 Fast 项报告各自优化的 normalized MSE。单位不同，不能相加，只用于定位误差来自 Slow
+  reference、力残差、陈旧修正，还是最终组合。现在每一项都有对应的头和监督，不再有"只报告、不优化"的项。
+- `staleness_vs_reference_drift`：陈旧头相对"输出零"（即单头学生的等效行为）的增益。
 - `per_step_residual_mse_normalized`：chunk 后几步是否也学到了。
 - 分平移 / 测地线旋转的物理误差。报告不再给出把 xyz 米和无量纲 6D 坐标混在一起的总体 pose MSE；
   `rotation_6d_coordinate_rmse` 只作表示诊断，模型排序看 `translation_rmse_m` 和
@@ -324,13 +330,36 @@ Force history 10×6 @100 Hz ─→ causal TCN ─→ 1 force token
 [context age, interp alpha]─→ time token               │
 learned residual query     ─→ query token              ┘
                                     ↓
-                    5 × xyz+6D residual，间隔一个 action period
+              force head:     5 × xyz+6D residual    （见到 force token）
+              staleness head: 5 × xyz+6D correction  （force token 被屏蔽）
 ```
 
 ```text
-A_cmd[k, :9] = A_ref(t + k·action_period)[:9] + delta_A[k]
+A_cmd[k, :9] = A_ref(t + k·action_period)[:9] + delta_force[k] + delta_stale[k]
 A_cmd[k, 9]  = A_ref(t + k·action_period)[9]      # gripper 由 Slow 独占
 ```
+
+**两个头，两个目标。** 部署时要补的总量是 `A_full(t) − A_ref(t)`，它恰好分解成两部分：
+
+```text
+delta_force 目标 = A_full(t) − A_null(t)      # 力改变了什么
+delta_stale 目标 = A_null(t) − A_ref(t) + (σ_state/σ_action)·(S_t − S_k)
+                                              # 语义缓存变旧期间参考漂移了多少
+```
+
+**陈旧目标里那一项基准修正不是可选的。** ForceVLA 的动作是相对 state 的 delta，而 `A_ref` 是相对
+Slow 观测那一行的 state `S_k` 的 delta，`A_null(t)` 是相对当前行 `S_t` 的 delta。两者原点不同，直接相减
+等于把两个不同原点的向量相减，漏掉的就是原点位移，换算到动作归一化单位就是 `(σ_state/σ_action)·(S_t − S_k)`。
+漏掉它会让物理旋转误差相对单头基线倒退 74.85%——旋转坐标在这两行之间的变化量和参考漂移本身同量级。
+`S_k` 在部署时来自 Slow packet 的 `state_at_observation`，`to_absolute_command` 已经在用它还原绝对指令。
+
+单头训练这个和是行不通的：陈旧项的 MSE 约为力残差的十四倍，实测把 `--reconstruction-weight` 开到 0.5
+就足以让力残差保真度从 +91.8% 掉到 −18.6%（比输出零还差），同时输出幅度从 0.135 涨到 0.282——单个头
+把容量全花在了大的那一项上，力归因的消融证据随之失效。
+
+陈旧项与力基本无关，因此 staleness head 走第二次 decoder 前向，**force token 在 attention mask 里被屏蔽**，
+力无关性由结构保证而不是靠损失函数自觉。评估脚本会在力消融下比较两次 staleness 输出，
+`staleness_force_blindness_max_deviation` 必须为 0。`--no-staleness-head` 退回单头的旧参数结构。
 
 **输出短 chunk 而不是单步**，所以 Fast 的输出速率与调用速率解耦：跟得上就只执行 `k=0`，落后了就往后
 多消费几步。后面几步只在落后时才执行，因此 loss 按 `--step-decay 0.5` 几何降权。
@@ -344,8 +373,10 @@ A_cmd[k, 9]  = A_ref(t + k·action_period)[9]      # gripper 由 Slow 独占
 force 的纯函数。Fast 通过缓存的 Slow context 接收这部分条件。如果要响应两次 Slow 更新之间出现的新视觉
 变化，才需要改变目标和输入定义。
 
-主实验只优化 `MSE(delta_A_fast, A_full - A_null)`；`--reconstruction-weight` 默认 0，避免 Fast 去学与力
-无关的 Slow 预测/插值误差。`predict_gate=false`，gate 接口保留但恒为 1。
+主实验优化两项：`MSE(delta_force, A_full − A_null)` 和 `MSE(delta_stale, 上式的基准修正后陈旧目标)`。两者都
+精确时它们的和就等于同一基准下的 `A_full − A_ref`，所以监督执行量的 `--reconstruction-weight` 在最优点冗余，默认 0；调高它是让两个
+头互相让渡误差。`predict_gate=false`，gate 接口保留但恒为 1，且**只作用于力残差**——gate 表达的是"对力读数
+不确信"，不该顺带决定要不要按一份过期的计划行动。
 
 ### Slow 时序按区间随机化
 
@@ -397,12 +428,15 @@ worker = slow_fast_loop.SlowWorker(
     config=contract.slow_fast_config(residual_limit=0.02),
     context_age_scale_s=contract.context_age_scale_s, period_s=0.1,
 )
+# predict_residual 返回 (力残差, 陈旧修正, gate)；陈旧修正为 None 表示单头学生。
+# 两个限幅必须分开给：陈旧修正通常比力残差大几倍，共用 residual_limit 会把它削掉。
 controller = slow_fast_loop.SlowFastController(
     cache=cache, force_buffer=force_buffer, predict_residual=student,
     unnormalize_action=normalizers["unnormalize_action"],
-    config=contract.slow_fast_config(residual_limit=0.02),
+    config=contract.slow_fast_config(residual_limit=0.02, staleness_limit=0.10),
     **{key: normalizers[key] for key in ("normalize_state", "normalize_force_history")},
 )
+assert contract.predicts_staleness, "两头学生才需要 staleness_limit；单头 run 这里是 False"
 
 # Fast inference 和 actuator 不在同一线程。Fast 完成时发布整个短 chunk；
 # actuator 按当前 timestamp 自动跳过推理期间已经过期的前几步。
@@ -447,7 +481,11 @@ worker 随后装入 packet 是正常的读序，不是错误——只在两个�
 `contract.check_measured_timing(slow_rate_hz=..., slow_latency_s=...)` 核对实测时序；超出带外要加宽带、
 同步加大 `--context-age-scale-ms`，重提 cache 并重训 Fast（Stage 1–3 不受影响）。
 
-还需要：安全门控、pose residual 限幅、确认 gripper 由 Slow 独占。
+`metadata.json` 的 `format_version` 为 2 时带 staleness head，`predict_staleness` 记录了这一点，
+`load_contract` 会读进 `contract.predicts_staleness`。用 version 1 的旧 checkpoint 时 `predict_residual`
+只返回两个值，控制器会当场抛错而不是静默少加一项。
+
+还需要：安全门控、力残差与陈旧修正各自的限幅、确认 gripper 由 Slow 独占。
 
 ## 配置
 
