@@ -127,7 +127,9 @@ Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与�
 
 ### 未完成
 
-1. README 主配置写成 two-head，`force_only` 列为 functional ablation（Codex 称已做，未复核）。
+**Codex 清单上的非训练项已全部清空。** 剩余问题都需要真机才能推进：force-blind 与 force-sighted
+的整体控制价值、contact 阈值能否识别 contact onset / jam / recovery、latency 的端到端口径。
+这三条在「措辞红线」里均已标明限定。
 
 ### 线性 probe 已可复现（2026-08-23，第三轮）
 
@@ -1137,6 +1139,27 @@ expert matching 为必须同表报告的行为诊断、真机为最终判据。�
 
 论文侧已在更早一轮统一改为 `null-mode residual distillation`，不再使用 counterfactual 作为方法名。
 红线（不得称 `A_full − A_null` 为唯一可归因的真实力因果效应或「纯物理动作」）保持有效。
+
+### 六、README 复核结果（Codex 第三轮建议第 1 项）
+
+Codex 那条**确实已做**：主训练命令用 `fast_residual_twohead_repro`、无 `--no-staleness-head`，
+`force_only` 在第 8 节「可选消融」下。但复核发现三处在本轮改动之后失效的内容，已一并修正（`33a0d66`）：
+
+1. **最要紧的一条，正是本轮那个 bug 的文档面。** README 原写
+   「`staleness_force_blindness_max_deviation` 必须为 0」。这在主配置下成立，但对
+   `--force-sighted-staleness` 的 run **恰恰相反**——那种 run 上读到 0 才说明 checkpoint 被装进了
+   错误的架构，也就是我本轮踩的坑。不改的话，下一个人按 README 核对会把加载错误当成正常。
+   同时把「head 布局从 checkpoint 自己读」改成从 `metadata.json` 读，并说明
+   `force_blind_staleness` / `analytic_rebase` 改变的是前向的**含义**而非形状，漏读不报错只静默出错。
+2. 两个新开关未入 README，`--analytic-rebase` 尤其危险（checkpoint 不可部署）。已在第 8 节加表说明
+   作用与状态，并补上线性 probe 的命令。
+3. 力盲那段只讲结构保证，未提代价与消融边界。已补：decoder 跑两遍成本翻倍；三 seed 结果；
+   以及「对 expert 口径反向，整体优劣待真机」的限定。
+
+另弱化一处：README 中「单个头把容量全花在大的那一项上」是对**单次运行**的解释性说法。
+它与归档区第四轮撤回的那条容量竞争结论**不是同一个实验**（那条是 force_only vs two-head 的 36 点对照，
+这条是 `--reconstruction-weight=0.5` 的单头实验），故未标为撤回，只注明「单次运行的观察，
+未做多 seed 复核，不应作为已证明的机制引用」。
 
 ### 六、未做
 
