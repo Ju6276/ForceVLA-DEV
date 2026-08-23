@@ -12,9 +12,14 @@ reason.
 
 A linear probe measures linear readability of these features, nothing more. It is
 not an information ceiling: a low value is equally consistent with the quantity
-being present but nonlinearly encoded. The `plus_key_state` row exists to separate
-the two possible readings of a weak result, since `S_k` is knowable at deployment
-but is deliberately not among the student's inputs.
+being present but nonlinearly encoded. The `key_state` rows exist to separate the
+two possible readings of a weak result, since `S_k` is knowable at deployment but
+is deliberately not among the student's inputs.
+
+`--ridge 0` is what the degeneracy check needs. Once `S_k` is in the features the
+two targets differ by a linear function of those features, so an unpenalized least
+squares must land on the same residual; any penalty, however small, breaks that
+identity and leaves two numbers that merely agree to several digits.
 """
 
 from __future__ import annotations
@@ -39,12 +44,28 @@ SLOW_RATE_BAND_HZ = (5.0, 15.0)
 SLOW_LATENCY_BAND_S = (0.050, 0.300)
 
 
-def _design_matrix(arrays, cache, *, include_key_state: bool) -> np.ndarray:
-    """Assemble the features the staleness head can actually see at inference.
+def _pooled_slow_context(cache) -> np.ndarray:
+    """Masked mean over the cached Slow context tokens, one vector per row.
+
+    The head reaches this context through a trained projector and attention, so a
+    mean is a weaker summary than what the model has. It is still the difference
+    between a probe over part of the head's inputs and a probe over all of them.
+    """
+    tokens = np.asarray(cache.context_tokens, dtype=np.float64)
+    mask = np.asarray(cache.context_mask, dtype=np.float64)[..., None]
+    pooled = np.sum(tokens * mask, axis=1) / np.maximum(np.sum(mask, axis=1), 1.0)
+    return pooled[cache.row_key_positions]
+
+
+def _design_matrix(arrays, cache, *, include_key_state: bool, include_slow_context: bool) -> np.ndarray:
+    """Assemble probe features from what the staleness head sees at inference.
 
     Force is excluded on purpose: the head is force-blind by construction, so a
-    probe that saw force would not be a baseline for it. `S_k` is excluded for the
-    same reason and only reinstated by the ablation flag.
+    probe that saw force would not be a baseline for it. Everything else the head
+    sees is available here, including the cached Slow context, which the tabular
+    feature set deliberately leaves out and `include_slow_context` restores. `S_k`
+    is a separate case: it is knowable at deployment but is deliberately not an
+    input, so it only appears under its own flag.
     """
     key_rows = cache.key_dataset_indices[cache.row_key_positions]
     columns = [
@@ -52,25 +73,63 @@ def _design_matrix(arrays, cache, *, include_key_state: bool) -> np.ndarray:
         cache.reference_actions[:, 0, :].astype(np.float32),
         cache.time_features,
     ]
+    if include_slow_context:
+        columns.append(_pooled_slow_context(cache))
     if include_key_state:
         columns.append(arrays.state[key_rows])
     features = np.concatenate([np.asarray(column, dtype=np.float64) for column in columns], axis=-1)
     return np.concatenate([features, np.ones((len(features), 1))], axis=-1)
 
 
-def _fit_and_score(train_x, train_y, val_x, val_y, *, ridge: float) -> dict:
+def _standardize(train_x, *others):
+    """Put every column on a comparable scale before a single ridge is applied.
+
+    The pooled Slow context contributes two thousand columns whose scale has nothing
+    to do with the ten state columns, so one penalty applied to raw features would
+    regularize the two blocks by wildly different amounts. The trailing intercept
+    column is left alone.
+    """
+    mean = np.mean(train_x[:, :-1], axis=0, keepdims=True)
+    std = np.std(train_x[:, :-1], axis=0, keepdims=True)
+    std = np.where(std < 1e-8, 1.0, std)
+
+    def apply(matrix):
+        return np.concatenate([(matrix[:, :-1] - mean) / std, matrix[:, -1:]], axis=-1)
+
+    return (apply(train_x), *(apply(other) for other in others))
+
+
+def _solve(train_x, train_y, ridge: float):
+    gram = train_x.T @ train_x
+    # Never penalize the intercept: doing so shrinks the target's mean toward zero
+    # and shows up as an apparent loss of fit that has nothing to do with features.
+    penalty = np.full(train_x.shape[1], ridge)
+    penalty[-1] = 0.0
+    gram[np.diag_indices_from(gram)] += penalty
+    return np.linalg.solve(gram, train_x.T @ train_y)
+
+
+def _fit_and_score(train_x, train_y, val_x, val_y, *, ridge_grid, dev_fraction: float = 0.2) -> dict:
     """Least squares on train, scored on val, with R2 taken about the val mean.
 
-    Scoring on a separate split matters more here than the choice of regularizer:
-    the design matrix has few columns against many rows, so an in-sample fit would
-    flatter the probe for reasons that have nothing to do with the question.
+    The regularizer is chosen on a split held out of train, never on val. With two
+    thousand context columns a fixed tiny ridge overfits badly enough to drive the
+    cross-set R2 negative, which would look like the context carrying no signal
+    when it only means the probe was under-regularized.
     """
-    gram = train_x.T @ train_x
-    gram[np.diag_indices_from(gram)] += ridge
-    weights = np.linalg.solve(gram, train_x.T @ train_y)
-    residual = val_y - val_x @ weights
+    if len(ridge_grid) > 1:
+        cut = int(len(train_x) * (1.0 - dev_fraction))
+        fit_x, dev_x = train_x[:cut], train_x[cut:]
+        fit_y, dev_y = train_y[:cut], train_y[cut:]
+        errors = [np.sum(np.square(dev_y - dev_x @ _solve(fit_x, fit_y, ridge))) for ridge in ridge_grid]
+        ridge = float(ridge_grid[int(np.argmin(errors))])
+    else:
+        ridge = float(ridge_grid[0])
+
+    residual = val_y - val_x @ _solve(train_x, train_y, ridge)
     total = val_y - np.mean(val_y, axis=0, keepdims=True)
     return {
+        "selected_ridge": ridge,
         "target_rms": float(np.sqrt(np.mean(np.square(val_y)))),
         "residual_rms": float(np.sqrt(np.mean(np.square(residual)))),
         "r2": float(1.0 - np.sum(np.square(residual)) / np.sum(np.square(total))),
@@ -106,7 +165,13 @@ def main() -> None:
     parser.add_argument("--val-slow-cache", type=pathlib.Path, required=True)
     parser.add_argument("--norm-stats-dir", type=pathlib.Path, required=True)
     parser.add_argument("--chunk-steps", type=int, default=5)
-    parser.add_argument("--ridge", type=float, default=1e-6)
+    parser.add_argument(
+        "--ridge",
+        type=float,
+        nargs="+",
+        default=[1e-4, 1e-2, 1.0, 1e2, 1e4, 1e6],
+        help="Ridge grid; the value is selected on a split held out of train. Pass a single value to fix it.",
+    )
     parser.add_argument("--timing-seed", type=int, default=0, help="Seed for the train-cache timing redraw.")
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
@@ -134,17 +199,26 @@ def main() -> None:
         )
         return np.asarray(full[:, 0], dtype=np.float64)
 
+    feature_sets = (
+        ("tabular", False, False),
+        ("tabular_plus_slow_context", False, True),
+        ("tabular_plus_key_state", True, False),
+        ("all_visible_plus_key_state", True, True),
+    )
     results = {}
-    for feature_name, include_key_state in (("student_visible", False), ("plus_key_state", True)):
-        train_x = _design_matrix(train_arrays, train_cache, include_key_state=include_key_state)[train_ready]
-        val_x = _design_matrix(val_arrays, val_cache, include_key_state=include_key_state)[val_ready]
+    for feature_name, include_key_state, include_slow_context in feature_sets:
+        kwargs = {"include_key_state": include_key_state, "include_slow_context": include_slow_context}
+        train_x, val_x = _standardize(
+            _design_matrix(train_arrays, train_cache, **kwargs)[train_ready],
+            _design_matrix(val_arrays, val_cache, **kwargs)[val_ready],
+        )
         for target_name, include_base_gap in (("base_corrected", True), ("drift_only", False)):
             results[f"{feature_name}/{target_name}"] = _fit_and_score(
                 train_x,
                 target(train_arrays, train_cache, train_ready, include_base_gap=include_base_gap),
                 val_x,
                 target(val_arrays, val_cache, val_ready, include_base_gap=include_base_gap),
-                ridge=args.ridge,
+                ridge_grid=args.ridge,
             )
 
     report = {
@@ -153,8 +227,16 @@ def main() -> None:
             "inference-time inputs. Not an information ceiling."
         ),
         "features": {
-            "student_visible": "state, reference action at the current tick, time features (no force, no S_k)",
-            "plus_key_state": "the above plus the state of the Slow packet's key row",
+            "tabular": (
+                "state, reference action at the current tick, time features. Deliberately "
+                "NOT the head's full visible input: the cached Slow context is left out."
+            ),
+            "tabular_plus_slow_context": (
+                "the above plus a masked mean over the cached Slow context tokens, which "
+                "covers everything the force-blind staleness head can see"
+            ),
+            "tabular_plus_key_state": "tabular plus the state of the Slow packet's key row",
+            "all_visible_plus_key_state": "slow context and key state together",
         },
         "targets": {
             "base_corrected": "A_null(t) - A_ref(t) + (sigma_state/sigma_action)(S_t - S_key), what the head is trained on",
@@ -163,7 +245,9 @@ def main() -> None:
         "protocol": {
             "fit_on": "train split",
             "scored_on": "val split",
-            "regressor": f"ridge least squares, lambda={args.ridge}, with intercept",
+            "regressor": "ridge least squares on standardized features, unpenalized intercept",
+            "ridge_grid": list(args.ridge),
+            "ridge_selected_on": "the last 20% of train, never on val" if len(args.ridge) > 1 else "fixed",
             "train_timing_seed": args.timing_seed,
             "slow_rate_band_hz": SLOW_RATE_BAND_HZ,
             "slow_latency_band_s": SLOW_LATENCY_BAND_S,
@@ -173,10 +257,13 @@ def main() -> None:
         "results": results,
     }
     print(json.dumps(report, indent=2))
-    header = f"{'features / target':<34}{'R2':>10}{'target RMS':>14}{'residual RMS':>15}"
+    header = f"{'features / target':<45}{'R2':>9}{'target RMS':>13}{'residual RMS':>21}{'ridge':>10}"
     print("\n" + header)
     for name, value in results.items():
-        print(f"{name:<34}{value['r2']:>10.4f}{value['target_rms']:>14.6f}{value['residual_rms']:>15.6f}")
+        print(
+            f"{name:<45}{value['r2']:>9.4f}{value['target_rms']:>13.6f}"
+            f"{value['residual_rms']:>21.15f}{value['selected_ridge']:>10g}"
+        )
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2))

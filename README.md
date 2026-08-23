@@ -346,11 +346,12 @@ python scripts/train_fast_residual.py \
 | 开关 | 作用 | 状态 |
 |---|---|---|
 | `--force-sighted-staleness` | staleness head 改从共享前向读出，不再屏蔽 force token。decoder 只跑一遍，fast path 成本减半 | 已测，主配置不采用 |
-| `--analytic-rebase` | staleness 目标去掉基准修正项，头只学 drift，闭式项在合成时加回 | **offline ablation only**，见下 |
+| `--analytic-rebase` | staleness 目标去掉基准修正项，头只学 drift，闭式项**仅在离线评估合成时**加回 | **offline ablation only**，见下 |
 
-`--analytic-rebase` 训练出的 checkpoint **不可部署**：只有评估脚本会把闭式项加回来以便同口径打分，
-`src/openpi/serving/` 里没有对应路径。该标志写入 `metadata.json` 的
-`analytic_rebase_is_offline_ablation_only`。
+`--analytic-rebase` 训练出的 checkpoint **不可部署**：只有 `scripts/evaluate_fast_residual.py` 会把闭式项
+加回来以便同口径打分，`src/openpi/serving/` 里没有对应路径。新训练的 run 会把
+`analytic_rebase_is_offline_ablation_only` 写进 `metadata.json`；`abl_analytic_rebase{,_s1,_s2}`
+三个既有产物是事后补写的，这些目录不在 Git 里，转移或重建时要确认该字段仍在。
 
 陈旧目标的线性可读性基线（不需要 GPU，train 拟合 val 打分）：
 
@@ -364,7 +365,9 @@ python scripts/probe_staleness_linearity.py \
     --output=artifacts/button_fast_evaluation/staleness_linear_probe.json
 ```
 
-它测的是线性可读性，不是信息上限：低值同样可能是量存在但被非线性编码。
+它测的是线性可读性，不是信息上限：低值同样可能是量存在但被非线性编码。特征分四组，`tabular` 故意
+**不含**缓存的 Slow context，`tabular_plus_slow_context` 才覆盖力盲陈旧头的全部可见输入。
+ridge 在 train 内部划出的 dev 上选，从不看 val；`--ridge 0` 用于验证加入 `S_k` 后两个目标残差重合的退化关系。
 
 时序扫描需要 held-out 的全速率 Slow cache；普通的 `val.npz` 是一个固定低速实现，不能向上重采样：
 

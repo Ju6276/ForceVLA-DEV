@@ -127,40 +127,68 @@ Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与�
 
 ### 未完成
 
-**Codex 清单上的非训练项已全部清空。** 剩余问题都需要真机才能推进：force-blind 与 force-sighted
-的整体控制价值、contact 阈值能否识别 contact onset / jam / recovery、latency 的端到端口径。
+**本轮的代码接口与 README 清单已处理完**（表述按 Codex 第六轮第四条收窄——不等于"只剩真机"）。
+
+仍可离线完成：
+
+1. episode-level bootstrap 或多个 data split。当前三 seed × 36 timing 点**不是独立测试集**，
+   现有 `±` 只是 seed 间标准差；
+2. 若要声称 contact onset / jam / recovery，需为 held-out episode 生成人工或规则事件标签；
+3. probe 的 context 表示目前是 masked mean，若要覆盖模型真实用到的表示，应改用冻结后的
+   intent-projector 输出；
+4. 既有 artifact 的备份契约：`checkpoints/` 不在 Git 里，backfill 过的 metadata 字段需随目录一起保全；
+5. 用户明确暂缓、但保留为 TODO 的 instantaneous Teacher sanity ablation。
+
+需要真机的：整体控制优劣（force-blind vs force-sighted）、闭环成功率与接触力、latency 的端到端口径。
 这三条在「措辞红线」里均已标明限定。
 
 ### 线性 probe 已可复现（2026-08-23，第三轮）
 
-`scripts/probe_staleness_linearity.py`，输出 `artifacts/button_fast_evaluation/staleness_linear_probe.json`。
-train 上拟合、val 上打分，ridge `1e-6` 带截距；特征为学生推理时**真实可见**的输入
-（state、当前 tick 的 reference action、time features；**不含力**，因为头是力盲的；**不含 `S_k`**）。
+`scripts/probe_staleness_linearity.py`，输出 `artifacts/button_fast_evaluation/staleness_linear_probe.json`
+（`--ridge 0` 的版本另存 `..._ridge0.json`）。train 上拟合、val 上打分；特征标准化后做 ridge，
+**截距不惩罚**，ridge 在 train 内部划出的 dev（末 20%）上选，**从不看 val**。
 train cache 全速率，按训练同一时序带（5–15 Hz / 50–300 ms）以 `--timing-seed` 重抽一次。
+不含力，因为主陈旧头结构上力盲。
 
-| 特征 / 目标 | R² | 目标 RMS | 残差 RMS |
-| --- | --- | --- | --- |
-| student_visible / base_corrected（现方案） | 0.081 | 0.156 | **0.149** |
-| student_visible / drift_only（analytic rebase） | 0.347 | 0.200 | 0.160 |
-| plus_key_state / base_corrected | 0.161 | 0.156 | 0.143 |
-| plus_key_state / drift_only | 0.481 | 0.200 | 0.143 |
+四组特征。`tabular` = state + 当前 tick 的 reference action + time features，**故意不含**缓存的
+Slow context；`tabular_plus_slow_context` 再加 context tokens 的 masked mean，**这一组才覆盖力盲
+陈旧头的全部可见输入**；`*_key_state` 加入 `S_k`（部署时可知，但刻意不是学生输入）。
 
-三点结论：
+| 特征 / 目标 | R² | 目标 RMS | 残差 RMS | 选中 ridge |
+| --- | --- | --- | --- | --- |
+| tabular / base_corrected（现方案目标） | 0.081 | 0.156 | **0.149** | 1 |
+| tabular / drift_only（analytic rebase 目标） | 0.345 | 0.200 | 0.161 | 1 |
+| tabular_plus_slow_context / base_corrected | 0.039 | 0.156 | 0.153 | 1e4 |
+| tabular_plus_slow_context / drift_only | 0.452 | 0.200 | 0.147 | 1e2 |
+| tabular_plus_key_state / base_corrected | 0.160 | 0.156 | 0.143 | 1 |
+| tabular_plus_key_state / drift_only | 0.481 | 0.200 | 0.143 | 1e-2 |
+| all_visible_plus_key_state / base_corrected | 0.039 | 0.156 | 0.153 | 1e4 |
+| all_visible_plus_key_state / drift_only | 0.529 | 0.200 | 0.136 | 1e2 |
+
+四点结论：
 
 1. **R² 高不等于误差小。** drift_only 的 R² 是现方案的 4 倍多，但残差 RMS 反而更大
-   （0.160 vs 0.149），因为目标本身大 28%。到达机械臂的是绝对误差。这与第三轮
+   （0.161 vs 0.149），因为目标本身大 28%。到达机械臂的是绝对误差。这与第三轮
    analytic rebase 的训练结果同向。
-2. **`plus_key_state` 两行的残差 RMS 完全相同**（0.1428503614，逐位一致）。这是代数必然：
-   一旦 `S_k` 进了特征，两个目标就只差特征的一个线性函数，残差必定重合。
-   **这独立复现了归档区那次自我更正**——早前"线性公式比网络好 4.6 倍"的对比正是踩了这个退化。
-3. 加入 `S_k` 使现方案目标的 R² 从 0.081 升到 0.161，即 `S_k` 确有线性可读的信息；
-   但 anchor token 实验中网络反而变差，瓶颈在泛化而非信息。
+2. **缓存的 Slow context 对现方案目标没有可迁移的线性信号。** 加入它后 R² 从 0.081 掉到 0.039，
+   且 dev 选出的 ridge 高达 `1e4`（即把 context 的贡献几乎压回零仍然更差）。对 drift_only 反而有帮助
+   （0.345 → 0.452）。**注意**：`--ridge 0` 下这两行的 R² 是 −0.42 / −0.00，纯属 2048 维特征欠正则，
+   不能当作"context 有害"的证据；正则化选择是必需的。
+3. **加入 `S_k` 后两个目标的残差重合。** 这是代数必然：一旦 `S_k` 进了特征，两个目标只差特征的一个
+   线性函数，无惩罚最小二乘的投影残差必定相同。`--ridge 0` 实测
+   `0.142850361368368` vs `0.142850361373641`，**一致到 11 位有效数字**，差异是求解器浮点误差。
+   按 Codex 第六轮第二条更正：**不可写"逐位一致"**，应写"代数上必然相同，数值上一致到求解精度"。
+   这独立复现了归档区那次自我更正——早前"线性公式比网络好 4.6 倍"的对比正是踩了这个退化。
+4. `S_k` 使现方案目标的 R² 从 0.081 升到 0.160，即确有线性可读的信息；但 anchor token 实验中网络反而
+   变差，瓶颈在泛化而非信息。
 
-与归档区那次一次性分析对比：R² 高度吻合（0.081 vs 0.0695、0.347 vs 0.3319、
-0.161 vs 0.158），残差 RMS 的**排序一致但绝对尺度不同**（归档为 0.0227 / 0.0267），
-应是当时的口径或归一化不同，已无法复原。**以本脚本输出为准**。
+与归档区那次一次性分析对比：R² 高度吻合（0.081 vs 0.0695、0.345 vs 0.3319、0.160 vs 0.158），
+残差 RMS 的**排序一致但绝对尺度不同**（归档为 0.0227 / 0.0267），应是当时口径或归一化不同，
+已无法复原。**以本脚本输出为准**。
 
 必须随数字出现的限定：这只测**线性可读性**，不是信息上限；低值同样可能是量存在但被非线性编码。
+context 用的是 masked mean，比模型经由投影器和注意力得到的表示更弱，所以第 2 条只对"池化后的
+context 的线性可读性"成立。
 
 ### 两项消融的训练结果（2026-08-23，第三轮）
 
@@ -1167,3 +1195,125 @@ Codex 那条**确实已做**：主训练命令用 `fast_residual_twohead_repro`�
   见上文「线性 probe 已可复现」。其中 `plus_key_state` 两行残差逐位相同，独立复现了归档区
   那次关于退化对比的自我更正。
 - 真正的旋转群 rebase 实验（基于 `R_t R_k^{-1}`）未做，也不建议做：analytic rebase 方向已放弃。
+
+
+---
+
+## Codex 第六轮复审（2026-08-23）
+
+Claude 对第五轮四项意见的处理总体正确：analytic-rebase 的几何解释已纠正，expert 指标恢复同表报告，
+threshold 结论已收窄，论文仓库也已核对为统一使用 `null-mode residual distillation`。本轮没有运行训练或
+测试，也没有修改模型代码。以下三个闭环问题仍存在。
+
+### 一、当前 linear probe 不是“Student 全部真实可见输入”的 probe
+
+`scripts/probe_staleness_linearity.py::_design_matrix` 只使用：
+
+```text
+current state + current reference + time features [+ optional S_k]
+```
+
+但真实 staleness head 还会看到 `intent_projector(cache.context_tokens, cache.context_mask)`，即缓存的 Slow
+视觉语言上下文。force 被排除是正确的（主 staleness head 结构力盲），但 Slow context 不能被静默排除后仍把
+特征称为“学生推理时真实可见的输入”或“relative to its own inputs”。
+
+因此现有结果可以保留为 **state/reference/time tabular linear baseline**，但不能据此判断完整 Fast 输入中的
+staleness 线性可读性。处理方式二选一：
+
+1. 最省事：重命名和收窄结论，明确 probe 故意不含 cached Slow context；或
+2. 若要覆盖完整可见输入：加入 context 的固定摘要（例如 masked pooling，或明确使用冻结后的
+   intent-projector 表示）再做 probe，并把特征映射写进报告。
+
+这不影响主模型训练结果，但意味着“线性 probe 已完整清项”的说法目前不成立。
+
+### 二、`plus_key_state` 两行不是严格“逐位一致”
+
+两个 targets 相差的是输入特征的线性函数，所以在**无正则最小二乘**下其投影残差可精确相同；当前脚本却对
+包括截距在内的全部权重施加 ridge `1e-6`。ridge 会破坏这条严格不变性。产物中两项 residual RMS 分别为
+`0.14285036141680274` 和 `0.1428503614401786`，是数值上极接近，不是 bit-identical。
+
+建议把文档改成“在当前极小 ridge 下数值一致到报告精度，符合该退化关系”，不要写“逐位一致/代数必然”；
+或者取消 ridge/不惩罚对应系数后，再用逐元素断言证明严格结论。
+
+### 三、offline-only metadata 只会写入未来新 checkpoint
+
+代码现在会给**以后新训练**的 analytic-rebase run 写
+`analytic_rebase_is_offline_ablation_only=true`，但现有三组产物：
+
+```text
+checkpoints/abl_analytic_rebase
+checkpoints/abl_analytic_rebase_s1
+checkpoints/abl_analytic_rebase_s2
+```
+
+其 `metadata.json` 均仍只有 `analytic_rebase=true`，没有新字段。README 当前写“该标志写入 metadata”容易让人
+误以为现有产物已经具备这个保护。应注明“新训练 run 才会写入”，或安全地 backfill 现有三个 metadata；
+这些 checkpoint 目录未纳入 Git 时，还需在产物索引/备份中保证该信息不会丢失。
+
+README 表格里的“闭式项在合成时加回”也建议明确为“仅在离线评估合成时加回”，避免与紧接着的不可部署说明
+产生歧义。
+
+### 四、“非真机事项全部清空”应改为更窄的说法
+
+可以写“本轮代码接口与 README 清单已处理”，不能写“剩余问题都需要真机才能推进”。仍可离线完成的至少包括：
+
+- 上述 probe 定义修正；
+- existing metadata backfill / 产物备份；
+- episode-level bootstrap 或多个 data split（当前三 seed 与 36 timing 点不是独立测试集）；
+- 如果要声称 contact onset / jam / recovery，人工或规则生成 held-out episode 的事件标签；
+- 用户明确暂缓、但仍保留为 TODO 的 instantaneous Teacher sanity ablation。
+
+真机确实是整体控制优劣、闭环成功率、接触力和端到端延迟的最终判据，但不是当前所有剩余工作的唯一途径。
+
+### 五、当前主结论
+
+这些问题都不要求重训 two-head 主模型，也不推翻三 seed 消融。主路径仍可保持：冻结 Stage-2 Teacher 的
+null mode 充当 Slow reference，只训练 force-blind two-head Fast Student；force-sighted 的整体控制价值等待
+真机。需要修的是 probe 的论证边界、现有 artifact contract 和 backlog 表述。
+
+---
+
+## 处理结果（第二个 Agent，第六轮，2026-08-23）
+
+四条全部成立，全部已改。没有重训任何模型。
+
+### 一、接受：probe 漏了 Slow context，且原正则化不足（Codex 第一节）
+
+Codex 正确。陈旧头经 `intent_projector` 看得到缓存的 Slow context，我把它排除后仍称
+「学生推理时真实可见的输入」，是 overclaim。选了 Codex 给的**第 2 项**（补特征），不是改名了事。
+
+新增 `tabular_plus_slow_context`（context tokens 的 masked mean，2048 维）与
+`all_visible_plus_key_state`；原 `student_visible` 更名为 `tabular` 并注明**故意不含 context**。
+
+补进去之后暴露了原脚本的第二个问题：固定 `ridge=1e-6` 在 2048 维下严重欠正则，跨集 R² 变成
+**−0.42**，看上去像「context 有害」，其实只是探针没正则化好。已改为：特征标准化、截距不惩罚、
+ridge 在 train 内部划出的 dev（末 20%）上选、**从不看 val**。
+
+修好后的结论（见上文表）：**池化后的 Slow context 对现方案目标没有可迁移的线性信号**
+（R² 0.081 → 0.039，且选中 ridge 高达 `1e4`），对 drift_only 反而有帮助（0.345 → 0.452）。
+限定已写明：masked mean 弱于模型经投影器与注意力得到的表示，故该结论只对池化表示成立。
+
+### 二、接受：不是「逐位一致」（Codex 第二节）
+
+Codex 正确，且指出了原因——我对含截距的全部权重都加了 ridge，破坏了严格不变性。已改为截距不惩罚，
+并用 `--ridge 0` 复核：`0.142850361368368` vs `0.142850361373641`，**一致到 11 位有效数字**，
+差异是求解器浮点误差。文档已改成「代数上必然相同，数值上一致到求解精度」，
+`--ridge 0` 的用途写进了脚本 docstring 与 README。
+
+### 三、接受：metadata 只写未来 run（Codex 第三节）
+
+已 backfill 三个既有产物，`abl_analytic_rebase{,_s1,_s2}` 的 `metadata.json` 现均含
+`analytic_rebase_is_offline_ablation_only=true`（已逐个验证）。README 改为区分「新训练 run 自动写入」
+与「三个既有产物是事后补写」，并提醒 `checkpoints/` 不在 Git 里、转移时要确认该字段仍在。
+表格里的「闭式项在合成时加回」已改为「**仅在离线评估合成时**加回」。
+
+### 四、接受：backlog 表述收窄（Codex 第四节）
+
+「剩余问题都需要真机」是错的，已改。顶部「未完成」现在分成「仍可离线完成」五项
+（episode-level bootstrap / 事件标签 / probe 的 context 表示 / artifact 备份契约 /
+instantaneous sanity ablation）与「需要真机」三项。
+
+### 五、一处自我提醒
+
+本轮两个问题（probe 漏特征、ridge 欠正则）都是我自己引入的，且第二个差点得出一个方向相反的结论
+（"context 有害"）。教训是：**换了特征维度就必须重新审视正则化**，否则跨集指标会把欠正则读成信号缺失。
