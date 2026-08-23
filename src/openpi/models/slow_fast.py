@@ -63,6 +63,11 @@ class FastResidualConfig:
     # capacity on the stale term and stops reproducing the force deviation at all.
     # Turning this off restores the single-head parameter tree of earlier runs.
     predict_staleness: bool = True
+    # Hide the force token from the staleness head by re-running the decoder with it
+    # masked out. Turning this off reads the staleness head off the shared forward
+    # instead, which halves the fast-path decoder cost and lets the head see force;
+    # the ablation measures whether the enforced independence buys anything.
+    force_blind_staleness: bool = True
     # The residual target is the Teacher's A_full - A_null, which does not depend
     # on the Slow reference the fast loop happens to be riding. Turning this off
     # measures whether the reference token carries anything the time features do
@@ -348,10 +353,13 @@ class FastForceResidualStudent(nnx.Module):
             # quantity, and hiding force makes that independence a property of the
             # architecture instead of something the loss has to be trusted to respect.
             # Sharing the decoder keeps the added parameters to one projection.
-            blind_mask = valid_mask.at[:, intent_length].set(False)
-            blind = self.decoder(tokens, blind_mask, context_length=context.shape[1], train=train)
+            if config.force_blind_staleness:
+                blind_mask = valid_mask.at[:, intent_length].set(False)
+                readout = self.decoder(tokens, blind_mask, context_length=context.shape[1], train=train)
+            else:
+                readout = hidden
             staleness = (
-                self.staleness_head(blind[:, -1]).astype(jnp.float32).reshape(b, config.chunk_steps, config.pose_dims)
+                self.staleness_head(readout[:, -1]).astype(jnp.float32).reshape(b, config.chunk_steps, config.pose_dims)
             )
         return residual, staleness, gate
 

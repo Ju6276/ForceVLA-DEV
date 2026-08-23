@@ -21,7 +21,7 @@ def test_selected_fast_defaults_use_10d_state_and_100hz_force():
     assert config.force_encoder.max_history_samples == 10
 
 
-def _config(*, predict_gate: bool = False, predict_staleness: bool = True):
+def _config(*, predict_gate: bool = False, predict_staleness: bool = True, force_blind_staleness: bool = True):
     return slow_fast.FastResidualConfig(
         reference_dim=7,
         state_dim=8,
@@ -34,6 +34,7 @@ def _config(*, predict_gate: bool = False, predict_staleness: bool = True):
         head_dim=16,
         predict_gate=predict_gate,
         predict_staleness=predict_staleness,
+        force_blind_staleness=force_blind_staleness,
         force_encoder=force_encoder.ForceEncoderConfig(
             type="tcn",
             hidden_dims=(32, 32),
@@ -82,6 +83,29 @@ def test_staleness_head_cannot_see_force_while_the_residual_head_can():
 
     np.testing.assert_array_equal(quiet_staleness, loud_staleness)
     assert not np.allclose(quiet_residual, loud_residual)
+
+
+def test_the_force_sighted_variant_lets_force_reach_the_staleness_head():
+    """The ablation switch has to actually change what the staleness head observes.
+
+    Without this, a run configured as force-sighted could silently keep the masked
+    second pass and the comparison against the blind model would measure nothing.
+    """
+    model = slow_fast.FastForceResidualStudent(_config(force_blind_staleness=False), rngs=nnx.Rngs(7))
+    for head, seed in ((model.residual_head, 11), (model.staleness_head, 12)):
+        head.kernel.value = jax.random.normal(jax.random.key(seed), head.kernel.value.shape)
+
+    conditions = (
+        jnp.ones((2, 2, 16)),
+        jnp.ones((2, 8)),
+        jnp.ones((2, 7)),
+        jnp.zeros((2, 2)),
+    )
+    mask = jnp.ones((2, 4), dtype=jnp.bool_)
+    _, quiet_staleness, _ = model(jnp.zeros((2, 4, 6)), mask, *conditions)
+    _, loud_staleness, _ = model(jnp.ones((2, 4, 6)) * 5.0, mask, *conditions)
+
+    assert not np.allclose(quiet_staleness, loud_staleness)
 
 
 def test_single_head_config_drops_the_staleness_projection():

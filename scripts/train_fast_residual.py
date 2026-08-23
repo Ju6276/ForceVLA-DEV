@@ -44,7 +44,15 @@ def _ready_row_indices(cache, n_rows: int) -> np.ndarray:
     return indices
 
 
-def _staleness_target(arrays, cache, indices: np.ndarray, *, pose_dims: int, state_to_action_scale) -> np.ndarray:
+def _staleness_target(
+    arrays,
+    cache,
+    indices: np.ndarray,
+    *,
+    pose_dims: int,
+    state_to_action_scale,
+    include_base_gap: bool = True,
+) -> np.ndarray:
     """The drift the reference accumulated, expressed on the current row's base.
 
     `A_ref` is a delta from the state of the *key* row while `A_null(t)` is a delta
@@ -53,10 +61,17 @@ def _staleness_target(arrays, cache, indices: np.ndarray, *, pose_dims: int, sta
     almost entirely wrong, since the arm's orientation moves as much between those two
     rows as the reference itself drifts. The gap is converted into action units
     because that is what the head's output is scaled by.
+
+    Both states are known at deployment, so the gap can also be supplied in closed
+    form and dropped from what the head has to learn. `include_base_gap=False` is that
+    ablation; a run trained this way is only correct if the caller adds the term back
+    when composing the command.
     """
     key_rows = cache.key_dataset_indices[cache.row_key_positions[indices]]
-    base_gap = arrays.state[indices, :pose_dims] - arrays.state[key_rows, :pose_dims]
     drift = arrays.null_pose[indices] - cache.reference_actions[indices, :, :pose_dims]
+    if not include_base_gap:
+        return drift.astype(np.float32)
+    base_gap = arrays.state[indices, :pose_dims] - arrays.state[key_rows, :pose_dims]
     return (drift + (state_to_action_scale * base_gap)[:, None, :]).astype(np.float32)
 
 
@@ -206,8 +221,28 @@ def main() -> None:
         type=float,
         default=1.0,
         help=(
-            "Weight on the stale-reference correction A_null(t) - A_ref(t). This is the "
-            "term that makes the objective depend on how old the cached context is."
+            "Weight on the stale-reference correction, base-corrected onto the current "
+            "row: A_null(t) - A_ref(t) + (sigma_state/sigma_action) * (S_t - S_key). "
+            "This is the term that makes the objective depend on how old the cached "
+            "context is."
+        ),
+    )
+    parser.add_argument(
+        "--analytic-rebase",
+        action="store_true",
+        help=(
+            "Ablation: drop the base-state gap from the staleness target and leave the "
+            "head only the unpredictable drift. Both states are known at deployment, so "
+            "the gap is added back in closed form when the command is composed."
+        ),
+    )
+    parser.add_argument(
+        "--force-sighted-staleness",
+        action="store_true",
+        help=(
+            "Ablation: read the staleness head off the shared forward instead of a "
+            "second pass with the force token masked out. Halves the decoder cost and "
+            "measures whether enforcing force-independence architecturally buys anything."
         ),
     )
     parser.add_argument(
@@ -296,6 +331,12 @@ def main() -> None:
         config = dataclasses.replace(config, use_reference_token=False)
     if args.no_staleness_head:
         config = dataclasses.replace(config, predict_staleness=False)
+    if args.force_sighted_staleness:
+        if args.no_staleness_head:
+            raise ValueError("--force-sighted-staleness needs a staleness head to be sighted")
+        config = dataclasses.replace(config, force_blind_staleness=False)
+    if args.analytic_rebase and args.no_staleness_head:
+        raise ValueError("--analytic-rebase only changes the staleness target, which needs a staleness head")
 
     state_to_action_scale = None
     if config.predict_staleness:
@@ -387,13 +428,16 @@ def main() -> None:
             f"{config.chunk_steps}-step normalized xyz+6D residual chunk spaced by the Teacher "
             "action period; gripper remains owned by Slow"
             + (
-                "; a second force-blind head emits the stale-reference correction and the "
-                "executed action is their sum"
+                f"; a second {'force-blind' if config.force_blind_staleness else 'force-sighted'} head "
+                "emits the stale-reference correction and the executed action is their sum"
                 if config.predict_staleness
                 else "; single head, no stale-reference correction"
             )
         ),
         "predict_staleness": config.predict_staleness,
+        # Deployment and evaluation must add the base-state gap back in closed form for
+        # a run trained this way, so the flag has to travel with the checkpoint.
+        "analytic_rebase": bool(args.analytic_rebase),
         "parameter_count": parameter_count,
         "config": {**vars(config), "force_encoder": vars(config.force_encoder)},
         "loss": vars(loss_config),
@@ -453,6 +497,7 @@ def main() -> None:
             indices,
             pose_dims=config.pose_dims,
             state_to_action_scale=state_to_action_scale,
+            include_base_gap=not args.analytic_rebase,
         )
 
     start_time = time.monotonic()

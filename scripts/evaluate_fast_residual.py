@@ -46,7 +46,7 @@ def to_absolute_pose(delta: np.ndarray, base_state: np.ndarray, action_stats, st
     return (physical + base).astype(np.float32)
 
 
-def _load_model(checkpoint: pathlib.Path, *, chunk_steps: int):
+def _load_model(checkpoint: pathlib.Path, *, chunk_steps: int, force_blind_staleness: bool = True):
     """Rebuild the student, taking the head layout from the checkpoint itself.
 
     Whether a run has a staleness head is not something the caller should have to
@@ -56,12 +56,32 @@ def _load_model(checkpoint: pathlib.Path, *, chunk_steps: int):
     """
     params = model_lib.restore_params(checkpoint)
     predicts_staleness = "staleness_head" in params.get("fast_student", {})
-    config = slow_fast.FastResidualConfig(chunk_steps=chunk_steps, predict_staleness=predicts_staleness)
+    config = slow_fast.FastResidualConfig(
+        chunk_steps=chunk_steps,
+        predict_staleness=predicts_staleness,
+        force_blind_staleness=force_blind_staleness,
+    )
     model = slow_fast.FastStudentWithIntentProjector(config, slow_context_dim=2048, rngs=nnx.Rngs(0))
     state = nnx.state(model, nnx.Param)
     state.replace_by_pure_dict(params)
     nnx.update(model, state)
     return model, predicts_staleness
+
+
+def _run_metadata(checkpoint: pathlib.Path) -> dict:
+    """Read the training run's metadata from whichever ancestor directory holds it.
+
+    Two of the recorded choices change what a forward pass means rather than what
+    shape it has, so a checkpoint loaded without them runs silently and wrongly:
+    `force_blind_staleness` decides whether the staleness head gets its own masked
+    pass, and `analytic_rebase` decides whether the base-state gap is part of what
+    the head emits or is supplied in closed form afterwards.
+    """
+    for directory in checkpoint.parents:
+        metadata = directory / "metadata.json"
+        if metadata.is_file():
+            return json.loads(metadata.read_text())
+    return {}
 
 
 def _predict_all(model, arrays, cache, *, batch_size: int, seed: int):
@@ -340,7 +360,12 @@ def main() -> None:
     baseline_by_row = fast_dataset.episode_baseline_wrench(
         wrench_by_row, arrays.episode_indices, num_rows=args.baseline_rows
     )
-    model, predicts_staleness = _load_model(args.checkpoint.resolve(), chunk_steps=cache.chunk_steps)
+    metadata = _run_metadata(args.checkpoint.resolve())
+    model, predicts_staleness = _load_model(
+        args.checkpoint.resolve(),
+        chunk_steps=cache.chunk_steps,
+        force_blind_staleness=bool(metadata.get("config", {}).get("force_blind_staleness", True)),
+    )
     metrics = evaluate(
         model,
         arrays,
@@ -349,6 +374,7 @@ def main() -> None:
         wrench_by_row,
         baseline_by_row,
         predicts_staleness=predicts_staleness,
+        analytic_rebase=bool(metadata.get("analytic_rebase", False)),
         contact_threshold_n=args.contact_threshold_n,
         baseline_rows=args.baseline_rows,
         batch_size=args.batch_size,
@@ -372,6 +398,7 @@ def evaluate(
     baseline_by_row,
     *,
     predicts_staleness: bool,
+    analytic_rebase: bool = False,
     contact_threshold_n: float,
     baseline_rows: int,
     batch_size: int = 256,
@@ -449,7 +476,6 @@ def evaluate(
     # only the scale, not the offset.
     scale = (np.asarray(action_stats.std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(np.float32)
     physical_predictions = {name: value * scale for name, value in normalized_predictions.items()}
-    physical_staleness = None if normalized_staleness is None else normalized_staleness * scale
     normalized_staleness_target = None
     if normalized_staleness is not None:
         # The reference is a delta from its own key row's state, so the drift is not
@@ -461,11 +487,16 @@ def evaluate(
         base_gap = arrays.state[:, : rot.POSE_DIMS] - state_by_row[cache.key_dataset_indices[cache.row_key_positions]][
             :, : rot.POSE_DIMS
         ]
+        rebase = (state_scale / scale) * base_gap
         normalized_staleness_target = (
-            arrays.null_pose[:, 0]
-            - cache.reference_actions[:, 0, : rot.POSE_DIMS].astype(np.float32)
-            + (state_scale / scale) * base_gap
+            arrays.null_pose[:, 0] - cache.reference_actions[:, 0, : rot.POSE_DIMS].astype(np.float32) + rebase
         )
+        if analytic_rebase:
+            # This run's head was trained on the drift alone. Supplying the gap here is
+            # what the deployed loop does, and it is also what keeps the reported
+            # staleness numbers on the same target as every other run's.
+            normalized_staleness = normalized_staleness + rebase
+    physical_staleness = None if normalized_staleness is None else normalized_staleness * scale
 
     wrench = wrench_by_row[ready]
     baseline = baseline_by_row[ready]
@@ -501,8 +532,11 @@ def evaluate(
         "chunk_steps": cache.chunk_steps,
         "per_step_residual_mse_normalized": per_step_residual_mse,
         "predicts_staleness": predicts_staleness,
-        # Must be exactly zero: the staleness head is evaluated under force ablations
-        # it structurally cannot see. Anything else means the force token is reaching it.
+        "analytic_rebase": analytic_rebase,
+        # Exactly zero for a force-blind run, whose staleness head is evaluated under
+        # force ablations it structurally cannot see; anything else means the force
+        # token is reaching it. For the force-sighted ablation the reverse holds, and a
+        # zero here would mean the checkpoint was loaded into the wrong architecture.
         "staleness_force_blindness_max_deviation": force_blindness_deviation,
         "contact": contact_summary,
         "strata": {
