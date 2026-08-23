@@ -180,11 +180,21 @@ def compose_reference_residual(
     reference_actions,
     residual_pose,
     *,
+    staleness_pose=None,
+    staleness_limit=None,
     gate: float = 1.0,
     pose_dims: int = 9,
     residual_limit=None,
 ) -> np.ndarray:
-    """Add only pose residuals; gripper and padding remain Slow-owned."""
+    """Add only pose corrections; gripper and padding remain Slow-owned.
+
+    The two corrections are clipped and gated separately on purpose. `residual_limit`
+    is a safety cap on how far contact is allowed to push the arm off the plan, while
+    the staleness correction only walks the reference forward to the present and is
+    routinely the larger of the two. Sharing one cap would silently throttle the
+    staleness head down to a force-sized budget, and gating the staleness term would
+    mean "distrust the force reading" also decides to act on an out-of-date plan.
+    """
     reference = np.asarray(reference_actions)
     residual = np.asarray(residual_pose)
     if reference.ndim != 2 or residual.ndim != 2 or reference.shape[-1] < pose_dims:
@@ -199,6 +209,16 @@ def compose_reference_residual(
         correction = np.clip(correction, -limit, limit)
     result = reference.copy()
     result[:, :pose_dims] += float(np.clip(gate, 0.0, 1.0)) * correction
+    if staleness_pose is not None:
+        staleness = np.asarray(staleness_pose)
+        if staleness.shape != (reference.shape[0], pose_dims):
+            raise ValueError(f"Expected staleness {(reference.shape[0], pose_dims)}, got {staleness.shape}")
+        if staleness_limit is not None:
+            limit = np.broadcast_to(np.asarray(staleness_limit), (pose_dims,))
+            if np.any(limit < 0):
+                raise ValueError("staleness_limit must be non-negative")
+            staleness = np.clip(staleness, -limit, limit)
+        result[:, :pose_dims] += staleness
     return result
 
 

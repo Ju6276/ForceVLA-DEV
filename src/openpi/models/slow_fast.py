@@ -1,6 +1,7 @@
 """Teacher-guided slow/fast student components.
 
-The Slow student owns a long nominal action chunk.  At each fast-loop tick the
+The Slow side is the frozen Teacher's null-force path, not a trained student; it
+owns a long nominal action chunk.  At each fast-loop tick the
 force-conditioned expert consumes the current interpolated reference and
 predicts a *short* chunk of pose residuals.  Every step of that short chunk is
 conditioned only on force and state up to the tick, which is exactly what the
@@ -55,6 +56,13 @@ class FastResidualConfig:
     head_dim: int = 256
     dropout_rate: float = 0.0
     predict_gate: bool = False
+    # Predict the stale-reference correction in a second head. The two quantities the
+    # deployed action needs are `A_full - A_null` (what force changes) and
+    # `A_null - A_ref(t)` (what the Slow context going stale costs). The latter is an
+    # order of magnitude larger, so a single head asked to emit their sum spends its
+    # capacity on the stale term and stops reproducing the force deviation at all.
+    # Turning this off restores the single-head parameter tree of earlier runs.
+    predict_staleness: bool = True
     # The residual target is the Teacher's A_full - A_null, which does not depend
     # on the Slow reference the fast loop happens to be riding. Turning this off
     # measures whether the reference token carries anything the time features do
@@ -224,11 +232,17 @@ class GemmaStyleDecoderLayer(nnx.Module):
 
 
 class FastForceResidualStudent(nnx.Module):
-    """One-block expert that predicts a short chunk of force-conditioned pose corrections.
+    """One-block expert that predicts a short chunk of pose corrections.
 
     Only the reference at the current tick is fed in as a token; the later steps of
     the emitted chunk are located by the Teacher's fixed action period, so the student
     does not need to see the reference waypoints it is correcting.
+
+    Two corrections are emitted, and what the robot executes is their sum on top of the
+    reference. The force head answers "what does the contact I feel now change", the
+    staleness head answers "how far has the reference drifted while the Slow context
+    aged". Keeping them apart is what lets the force ablations stay interpretable: a
+    single head trained on the sum is dominated by the larger stale term.
     """
 
     def __init__(self, config: FastResidualConfig, *, rngs: nnx.Rngs):
@@ -255,6 +269,18 @@ class FastForceResidualStudent(nnx.Module):
             output_dim,
             kernel_init=nnx.initializers.zeros_init(),
             rngs=rngs,
+        )
+        # No gate: gating exists to attenuate the force correction under safety
+        # doubt, and holding a stale reference in place is not the safe fallback.
+        self.staleness_head = (
+            nnx.Linear(
+                config.width,
+                config.pose_dims * config.chunk_steps,
+                kernel_init=nnx.initializers.zeros_init(),
+                rngs=rngs,
+            )
+            if config.predict_staleness
+            else None
         )
 
     def __call__(
@@ -314,11 +340,24 @@ class FastForceResidualStudent(nnx.Module):
         span = config.pose_dims * config.chunk_steps
         residual = output[..., :span].reshape(b, config.chunk_steps, config.pose_dims)
         gate = jax.nn.sigmoid(output[..., span]) if config.predict_gate else jnp.ones((b,))
-        return residual, gate
+
+        staleness = None
+        if self.staleness_head is not None:
+            # Second pass with the force token dropped from every query's view. What
+            # the reference lost while the Slow context aged is a force-independent
+            # quantity, and hiding force makes that independence a property of the
+            # architecture instead of something the loss has to be trusted to respect.
+            # Sharing the decoder keeps the added parameters to one projection.
+            blind_mask = valid_mask.at[:, intent_length].set(False)
+            blind = self.decoder(tokens, blind_mask, context_length=context.shape[1], train=train)
+            staleness = (
+                self.staleness_head(blind[:, -1]).astype(jnp.float32).reshape(b, config.chunk_steps, config.pose_dims)
+            )
+        return residual, staleness, gate
 
 
 class FastStudentWithIntentProjector(nnx.Module):
-    """Trainable Stage-5 head on top of a frozen Slow vision-language context."""
+    """Trainable Stage-4 head on top of a frozen Slow vision-language context."""
 
     def __init__(
         self,
@@ -349,7 +388,7 @@ class FastStudentWithIntentProjector(nnx.Module):
         train: bool = False,
     ):
         intent_tokens = self.intent_projector(slow_context, slow_context_mask)
-        residual, gate = self.fast_student(
+        residual, staleness, gate = self.fast_student(
             force_history,
             force_history_mask,
             intent_tokens,
@@ -358,4 +397,4 @@ class FastStudentWithIntentProjector(nnx.Module):
             time_features,
             train=train,
         )
-        return residual, gate, intent_tokens
+        return residual, staleness, gate, intent_tokens

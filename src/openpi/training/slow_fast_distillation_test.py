@@ -1,3 +1,5 @@
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -52,6 +54,61 @@ def test_fast_loss_weights_the_executed_step_above_the_lookahead():
     assert float(first) == pytest.approx(2.0 * float(second))
     # Normalized weights keep the loss scale independent of the chunk length.
     np.testing.assert_allclose(np.sum(np.asarray(config.step_weights(5))), 1.0, atol=1e-6)
+
+
+def test_two_heads_summing_to_the_stale_gap_reconstruct_the_full_action():
+    """A stale reference is recovered exactly by the two targets together.
+
+    `A_full - A_ref` splits into the force deviation and the drift the reference
+    accumulated, so a student that nails both targets lands on the Teacher even
+    though neither target on its own describes what it must add to the reference.
+    """
+    reference = jnp.full((1, 2, 10), 0.3)
+    null = jnp.zeros((1, 2, 10)).at[..., 9].set(0.75)
+    full = null.at[..., :9].set(0.25)
+    chunk = slow_fast_distillation.select_chunk_targets(
+        slow_fast_distillation.make_paired_teacher_targets(full, null), chunk_steps=2
+    )
+    staleness_target = null[..., :9] - reference[..., :9]
+    targets = dataclasses.replace(chunk, staleness_pose=staleness_target)
+
+    total, metrics = slow_fast_distillation.fast_residual_loss(
+        targets.residual_pose,
+        reference,
+        targets,
+        slow_fast_distillation.FastDistillationLossConfig(),
+        predicted_staleness=staleness_target,
+    )
+    np.testing.assert_allclose(total, 0, atol=1e-12)
+    np.testing.assert_allclose(metrics["reconstruction_loss"], 0, atol=1e-12)
+    np.testing.assert_allclose(metrics["staleness_loss"], 0, atol=1e-12)
+
+    # Dropping the staleness correction leaves exactly the reference drift behind.
+    _, single_head = slow_fast_distillation.fast_residual_loss(
+        targets.residual_pose,
+        reference,
+        chunk,
+        slow_fast_distillation.FastDistillationLossConfig(),
+    )
+    np.testing.assert_allclose(
+        single_head["reconstruction_loss"], float(jnp.mean(jnp.square(staleness_target))), rtol=1e-6
+    )
+    assert "staleness_loss" not in single_head
+
+
+def test_staleness_prediction_and_target_must_be_supplied_together():
+    chunk = slow_fast_distillation.select_chunk_targets(
+        slow_fast_distillation.make_paired_teacher_targets(jnp.zeros((1, 2, 10)), jnp.zeros((1, 2, 10))),
+        chunk_steps=2,
+    )
+    with pytest.raises(ValueError, match="staleness target"):
+        slow_fast_distillation.fast_residual_loss(
+            chunk.residual_pose,
+            jnp.zeros((1, 2, 10)),
+            chunk,
+            slow_fast_distillation.FastDistillationLossConfig(),
+            predicted_staleness=jnp.zeros((1, 2, 9)),
+        )
 
 
 def test_paired_targets_require_matching_shapes():

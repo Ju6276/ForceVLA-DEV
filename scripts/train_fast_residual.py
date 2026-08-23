@@ -18,6 +18,7 @@ import wandb
 
 from openpi.models import force_encoder
 from openpi.models import slow_fast
+from openpi.shared import normalize as normalize_lib
 from openpi.training import fast_dataset
 from openpi.training import slow_fast_distillation
 
@@ -43,10 +44,29 @@ def _ready_row_indices(cache, n_rows: int) -> np.ndarray:
     return indices
 
 
-def _make_batch(arrays, cache, indices: np.ndarray) -> dict[str, jax.Array]:
+def _staleness_target(arrays, cache, indices: np.ndarray, *, pose_dims: int, state_to_action_scale) -> np.ndarray:
+    """The drift the reference accumulated, expressed on the current row's base.
+
+    `A_ref` is a delta from the state of the *key* row while `A_null(t)` is a delta
+    from the current row's state, so their difference is not the drift: it is missing
+    the base-state gap between the two rows. Left out, the target's rotation part is
+    almost entirely wrong, since the arm's orientation moves as much between those two
+    rows as the reference itself drifts. The gap is converted into action units
+    because that is what the head's output is scaled by.
+    """
+    key_rows = cache.key_dataset_indices[cache.row_key_positions[indices]]
+    base_gap = arrays.state[indices, :pose_dims] - arrays.state[key_rows, :pose_dims]
+    drift = arrays.null_pose[indices] - cache.reference_actions[indices, :, :pose_dims]
+    return (drift + (state_to_action_scale * base_gap)[:, None, :]).astype(np.float32)
+
+
+def _make_batch(arrays, cache, indices: np.ndarray, *, staleness_target=None) -> dict[str, jax.Array]:
     key_positions = cache.row_key_positions[indices]
     reference_chunk = jnp.asarray(cache.reference_actions[indices], dtype=jnp.float32)
+    if staleness_target is not None:
+        staleness_target = jnp.asarray(staleness_target, dtype=jnp.float32)
     return {
+        "target_staleness": staleness_target,
         "slow_context": jnp.asarray(cache.context_tokens[key_positions], dtype=jnp.float32),
         "slow_context_mask": jnp.asarray(cache.context_mask[key_positions], dtype=jnp.bool_),
         "force_history": jnp.asarray(arrays.force_history[indices], dtype=jnp.float32),
@@ -64,7 +84,7 @@ def _make_batch(arrays, cache, indices: np.ndarray) -> dict[str, jax.Array]:
 
 
 def _loss(model, batch, loss_config, *, train: bool):
-    predicted, _, _ = model(
+    predicted, staleness, _, _ = model(
         batch["slow_context"],
         batch["slow_context_mask"],
         batch["force_history"],
@@ -74,32 +94,37 @@ def _loss(model, batch, loss_config, *, train: bool):
         batch["time_features"],
         train=train,
     )
+    pose_dims = loss_config.pose_dims
+    staleness_target = batch["target_staleness"] if staleness is not None else None
     target = slow_fast_distillation.FastChunkTargets(
         full_action=batch["target_full_pose"],
         nominal_action=batch["reference_chunk"],
         residual_pose=batch["target_residual"],
+        staleness_pose=staleness_target,
     )
     total, parts = slow_fast_distillation.fast_residual_loss(
         predicted,
         batch["reference_chunk"],
         target,
         loss_config,
+        predicted_staleness=staleness,
     )
     prediction_l2 = jnp.mean(jnp.linalg.norm(predicted, axis=-1))
     target_l2 = jnp.mean(jnp.linalg.norm(batch["target_residual"], axis=-1))
-    # What the robot actually executes is A_ref + delta. Its error against the Teacher
-    # splits, as vectors, into a force-agnostic Slow term and the Fast term the loss
-    # optimizes; only the latter is trained on. The mean squares carry a cross term and
-    # do not add up, so compare their magnitudes and read `deployment_error` for the sum.
-    pose_dims = loss_config.pose_dims
+    # What the robot actually executes is A_ref + force + staleness. Its error against
+    # the Teacher no longer splits into a trained and an untrained half: this is the
+    # zero-correction baseline for the staleness head, not an error nobody owns.
     slow_error = jnp.mean(jnp.square(batch["reference_chunk"][..., :pose_dims] - batch["target_null_pose"]))
-    return total, {
+    metrics = {
         **parts,
         "prediction_l2": prediction_l2,
         "target_l2": target_l2,
         "slow_reference_error": slow_error,
         "deployment_error": parts["reconstruction_loss"],
     }
+    if staleness is not None:
+        metrics["staleness_prediction_l2"] = jnp.mean(jnp.linalg.norm(staleness, axis=-1))
+    return total, metrics
 
 
 def _save_params(model, output_dir: pathlib.Path, step: int) -> None:
@@ -150,6 +175,16 @@ def main() -> None:
     parser.add_argument("--train-slow-cache", type=pathlib.Path, required=True)
     parser.add_argument("--val-slow-cache", type=pathlib.Path, required=True)
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--norm-stats-dir",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Directory holding norm_stats.json. Required with the staleness head: its "
+            "target spans two different base states, and converting that gap into "
+            "action units needs the state and action scales."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--warmup-steps", type=int, default=500)
@@ -160,7 +195,29 @@ def main() -> None:
         "--reconstruction-weight",
         type=float,
         default=0.0,
-        help="Auxiliary full-action reconstruction weight. Keep at zero for pure Teacher residual specialization.",
+        help=(
+            "Weight on the executed action A_ref + force + staleness. With both heads "
+            "supervised on their own targets this term is redundant at the optimum, so "
+            "it stays off by default; raise it to let the heads trade errors off."
+        ),
+    )
+    parser.add_argument(
+        "--staleness-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on the stale-reference correction A_null(t) - A_ref(t). This is the "
+            "term that makes the objective depend on how old the cached context is."
+        ),
+    )
+    parser.add_argument(
+        "--no-staleness-head",
+        action="store_true",
+        help=(
+            "Ablation: single-head student, as before the staleness head existed. The "
+            "force residual then carries no information about context age, and the "
+            "stale-reference error is left entirely unoptimized."
+        ),
     )
     parser.add_argument(
         "--chunk-steps",
@@ -237,6 +294,23 @@ def main() -> None:
     config = _model_config(args.model_profile, chunk_steps=args.chunk_steps)
     if args.no_reference_token:
         config = dataclasses.replace(config, use_reference_token=False)
+    if args.no_staleness_head:
+        config = dataclasses.replace(config, predict_staleness=False)
+
+    state_to_action_scale = None
+    if config.predict_staleness:
+        if args.norm_stats_dir is None or not (args.norm_stats_dir / "norm_stats.json").is_file():
+            raise ValueError(
+                "--norm-stats-dir must point at a directory containing norm_stats.json when the "
+                "staleness head is enabled, or pass --no-staleness-head. The target is a gap "
+                "between two base states, and without the scales it cannot be put in action units."
+            )
+        norm_stats = normalize_lib.load(args.norm_stats_dir)
+        pose = config.pose_dims
+        state_to_action_scale = (
+            (np.asarray(norm_stats["state"].std, dtype=np.float64)[:pose] + 1e-6)
+            / (np.asarray(norm_stats["actions"].std, dtype=np.float64)[:pose] + 1e-6)
+        ).astype(np.float32)
 
     train_arrays = fast_dataset.load_stage3_fast_arrays(args.train_targets, chunk_steps=config.chunk_steps)
     val_arrays = fast_dataset.load_stage3_fast_arrays(args.val_targets, chunk_steps=config.chunk_steps)
@@ -260,6 +334,7 @@ def main() -> None:
     loss_config = slow_fast_distillation.FastDistillationLossConfig(
         residual_weight=1.0,
         reconstruction_weight=args.reconstruction_weight,
+        staleness_weight=args.staleness_weight,
         step_decay=args.step_decay,
     )
     schedule = optax.warmup_cosine_decay_schedule(
@@ -304,12 +379,21 @@ def main() -> None:
     )
     (args.output_dir / "wandb_id.txt").write_text(run.id)
     metadata = {
-        "format_version": 1,
+        # 2 adds the staleness head, which deployment must add to the reference on top
+        # of the force residual. A version-1 run must not be composed as if it had one.
+        "format_version": 2,
         "architecture": "100 Hz causal TCN + pooled Slow V-L context + one Gemma-style layer + 9D pose residual",
         "fast_output": (
             f"{config.chunk_steps}-step normalized xyz+6D residual chunk spaced by the Teacher "
             "action period; gripper remains owned by Slow"
+            + (
+                "; a second force-blind head emits the stale-reference correction and the "
+                "executed action is their sum"
+                if config.predict_staleness
+                else "; single head, no stale-reference correction"
+            )
         ),
+        "predict_staleness": config.predict_staleness,
         "parameter_count": parameter_count,
         "config": {**vars(config), "force_encoder": vars(config.force_encoder)},
         "loss": vars(loss_config),
@@ -360,6 +444,17 @@ def main() -> None:
         size=min(args.eval_samples, len(val_pool)),
         replace=False,
     )
+    def _staleness(arrays, cache, indices):
+        if state_to_action_scale is None:
+            return None
+        return _staleness_target(
+            arrays,
+            cache,
+            indices,
+            pose_dims=config.pose_dims,
+            state_to_action_scale=state_to_action_scale,
+        )
+
     start_time = time.monotonic()
     last_metrics = None
     for step in range(args.steps):
@@ -378,7 +473,16 @@ def main() -> None:
                 step=step,
             )
         indices = rng.choice(train_pool, size=args.batch_size, replace=True)
-        metrics = train_step(model, optimizer, _make_batch(train_arrays, train_cache, indices))
+        metrics = train_step(
+            model,
+            optimizer,
+            _make_batch(
+                train_arrays,
+                train_cache,
+                indices,
+                staleness_target=_staleness(train_arrays, train_cache, indices),
+            ),
+        )
         if step % 100 == 0:
             last_metrics = {f"train/{name}": float(value) for name, value in jax.device_get(metrics).items()}
             last_metrics["train/learning_rate"] = float(schedule(step))
@@ -400,7 +504,15 @@ def main() -> None:
             totals: list[tuple[int, dict]] = []
             for start in range(0, len(eval_indices), args.batch_size):
                 batch_indices = eval_indices[start : start + args.batch_size]
-                loss, parts = eval_step(model, _make_batch(val_arrays, val_cache, batch_indices))
+                loss, parts = eval_step(
+                    model,
+                    _make_batch(
+                        val_arrays,
+                        val_cache,
+                        batch_indices,
+                        staleness_target=_staleness(val_arrays, val_cache, batch_indices),
+                    ),
+                )
                 totals.append((len(batch_indices), {"loss": loss, **parts}))
             total_examples = sum(count for count, _ in totals)
             val_metrics = {
@@ -425,6 +537,16 @@ def main() -> None:
             val_metrics["val/residual_gain_vs_zero"] = 1.0 - val_metrics["val/residual_loss_step0"] / max(
                 zero_residual_mse, 1e-12
             )
+            if config.predict_staleness:
+                # Emitting zero is what the single-head student effectively did, so this
+                # is the baseline the staleness head has to beat to be worth its capacity.
+                zero_staleness_mse = float(
+                    np.mean(np.square(_staleness(val_arrays, val_cache, eval_indices)[:, 0]))
+                )
+                val_metrics["val/zero_staleness_mse"] = zero_staleness_mse
+                val_metrics["val/staleness_gain_vs_zero"] = 1.0 - val_metrics["val/staleness_loss_step0"] / max(
+                    zero_staleness_mse, 1e-12
+                )
             val_metrics["val/reconstruction_gain_vs_reference"] = 1.0 - val_metrics[
                 "val/reconstruction_loss_step0"
             ] / max(reference_only_mse, 1e-12)

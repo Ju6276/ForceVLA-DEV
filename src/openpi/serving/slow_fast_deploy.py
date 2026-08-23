@@ -42,6 +42,9 @@ class DeploymentContract:
     # cache: it is extracted full-rate so training can redraw the timing itself.
     slow_rate_range_hz: tuple[float, float] | None
     slow_latency_range_s: tuple[float, float] | None
+    # Whether the Fast run emits a stale-reference correction alongside the force
+    # residual. None when no Fast run was supplied, so it could not be read.
+    predicts_staleness: bool | None = None
 
     def slow_fast_config(self, **overrides) -> slow_fast_loop.SlowFastConfig:
         settings = {
@@ -107,13 +110,17 @@ def load_contract(slow_cache: str | pathlib.Path, *, fast_run: str | pathlib.Pat
     try:
         _, context_tokens, _ = summary["pooled_context_shape"]
         timing = summary
+        predicts_staleness = None
         if fast_run is not None:
             run = pathlib.Path(fast_run)
             metadata = json.loads((run if run.suffix == ".json" else run / "metadata.json").read_text())
             timing = metadata.get("trained_timing")
             if not timing:
                 raise ValueError(f"{run} records no trained_timing; it predates timing randomization")
+            # Absent in format_version 1, where there was only one head.
+            predicts_staleness = bool(metadata.get("predict_staleness", False))
         contract = DeploymentContract(
+            predicts_staleness=predicts_staleness,
             context_tokens=int(context_tokens),
             action_dims=int(summary["action_chunk_shape"][-1]),
             chunk_steps=int(summary["chunk_steps"]),

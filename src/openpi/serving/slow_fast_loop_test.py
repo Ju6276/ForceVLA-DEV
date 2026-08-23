@@ -153,13 +153,21 @@ def test_absolute_command_undoes_normalization_before_rebasing():
     np.testing.assert_allclose(command[:, 1], 2.0)
 
 
-def _controller(cache, *, residual=None, residual_limit=None, observer=None):
+def _controller(
+    cache,
+    *,
+    residual=None,
+    residual_limit=None,
+    staleness=None,
+    staleness_limit=None,
+    observer=None,
+):
     residual = np.full((2, 6), 0.05, dtype=np.float32) if residual is None else residual
 
     def predict(**kwargs):
         if observer is not None:
             observer(kwargs)
-        return residual, 1.0
+        return residual, staleness, 1.0
 
     return slow_fast_loop.SlowFastController(
         cache=cache,
@@ -175,6 +183,7 @@ def _controller(cache, *, residual=None, residual_limit=None, observer=None):
             delta_dims=6,
             chunk_steps=2,
             residual_limit=residual_limit,
+            staleness_limit=staleness_limit,
             max_staleness_s=0.25,
         ),
     )
@@ -228,7 +237,7 @@ def test_controller_normalizes_masked_force_slots_the_way_training_does():
 
     def predict(**kwargs):
         seen.update(kwargs)
-        return np.zeros((2, 6), dtype=np.float32), 1.0
+        return np.zeros((2, 6), dtype=np.float32), None, 1.0
 
     slow_fast_loop.SlowFastController(
         cache=cache,
@@ -261,6 +270,42 @@ def test_controller_clips_the_residual_to_the_configured_limit():
     result = _controller(cache, residual=np.full((2, 6), 5.0), residual_limit=0.01).step(1.0, np.zeros(7))
 
     np.testing.assert_allclose(result["command"][:, :6], 0.01, atol=1e-6)
+
+
+def test_controller_clips_the_staleness_correction_on_its_own_budget():
+    """The force cap must not throttle the stale-reference correction.
+
+    The staleness term routinely exceeds the force residual, so sharing one limit
+    would clip away most of what the staleness head was trained to recover while
+    every shape check still passed.
+    """
+    cache = slow_fast_runtime.SlowReferenceCache()
+    cache.update(_packet(state_at_observation=np.zeros(7)))
+
+    result = _controller(
+        cache,
+        residual=np.full((2, 6), 5.0),
+        residual_limit=0.01,
+        staleness=np.full((2, 6), 5.0, dtype=np.float32),
+        staleness_limit=0.2,
+    ).step(1.0, np.zeros(7))
+
+    np.testing.assert_allclose(result["command"][:, :6], 0.21, atol=1e-6)
+
+
+def test_controller_reports_the_staleness_correction_it_applied():
+    cache = slow_fast_runtime.SlowReferenceCache()
+    cache.update(_packet(state_at_observation=np.zeros(7)))
+    staleness = np.full((2, 6), 0.03, dtype=np.float32)
+
+    applied = _controller(cache, staleness=staleness).step(1.0, np.zeros(7))
+    single_head = _controller(cache).step(1.0, np.zeros(7))
+
+    np.testing.assert_allclose(applied["staleness_normalized"], staleness)
+    assert single_head["staleness_normalized"] is None
+    np.testing.assert_allclose(
+        applied["command"][:, :6] - single_head["command"][:, :6], 0.03, atol=1e-6
+    )
 
 
 def test_controller_refuses_to_extrapolate_a_stale_reference():
@@ -338,7 +383,7 @@ def test_production_controller_rejects_raw_7d_state_at_its_boundary():
     controller = slow_fast_loop.SlowFastController(
         cache=cache,
         force_buffer=_buffer(),
-        predict_residual=lambda **_: (np.zeros((2, rot.POSE_DIMS), dtype=np.float32), 1.0),
+        predict_residual=lambda **_: (np.zeros((2, rot.POSE_DIMS), dtype=np.float32), None, 1.0),
         normalize_state=lambda state: state,
         normalize_force_history=lambda force: force,
         unnormalize_action=lambda action: action,

@@ -96,6 +96,11 @@ class SlowFastConfig:
     # Per-dimension cap on the Fast correction, in normalized action units. Leaving
     # this unset lets an unbounded residual reach the arm.
     residual_limit: np.ndarray | float | None = None
+    # Separate cap for the stale-reference correction, which is normally several times
+    # larger than the force residual. Reusing residual_limit here would clip the
+    # staleness head down to a force-sized budget and undo most of what it was
+    # trained to recover.
+    staleness_limit: np.ndarray | float | None = None
 
     def __post_init__(self) -> None:
         if self.action_period_s <= 0 or self.max_staleness_s < 0:
@@ -189,14 +194,16 @@ class SlowWorker:
 
 
 class SlowFastController:
-    """Composes the current Slow reference with one Fast force correction."""
+    """Composes the current Slow reference with the Fast force and staleness corrections."""
 
     def __init__(
         self,
         *,
         cache: slow_fast_runtime.SlowReferenceCache,
         force_buffer: ForceStreamBuffer,
-        predict_residual: Callable[..., tuple[np.ndarray, float]],
+        # Returns (force residual, stale-reference correction, gate). The second entry
+        # is None for a single-head student trained before the staleness head existed.
+        predict_residual: Callable[..., tuple[np.ndarray, np.ndarray | None, float]],
         normalize_state: Callable[[np.ndarray], np.ndarray],
         normalize_force_history: Callable[[np.ndarray], np.ndarray],
         unnormalize_action: Callable[[np.ndarray], np.ndarray],
@@ -262,7 +269,7 @@ class SlowFastController:
             raise ValueError(
                 f"Normalized robot state must remain finite with shape {state.shape}, got {normalized_state.shape}"
             )
-        residual, gate = self._predict_residual(
+        residual, staleness, gate = self._predict_residual(
             intent_tokens=packet.intent_tokens,
             intent_mask=packet.intent_mask,
             force_history=force_history,
@@ -274,6 +281,8 @@ class SlowFastController:
         composed = slow_fast_runtime.compose_reference_residual(
             reference,
             residual,
+            staleness_pose=staleness,
+            staleness_limit=config.staleness_limit,
             gate=gate,
             pose_dims=config.pose_dims,
             residual_limit=config.residual_limit,
@@ -288,6 +297,7 @@ class SlowFastController:
             "command_period_s": config.action_period_s,
             "reference_normalized": reference,
             "residual_normalized": np.asarray(residual, dtype=np.float32),
+            "staleness_normalized": None if staleness is None else np.asarray(staleness, dtype=np.float32),
             "gate": float(gate),
             "packet_version": packet.version,
             "context_age_s": timestamp - packet.observation_timestamp,

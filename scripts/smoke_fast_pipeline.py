@@ -178,10 +178,11 @@ def main() -> None:
             full_action=jnp.asarray(arrays.full_pose[indices]),
             nominal_action=reference_chunk,
             residual_pose=jnp.asarray(arrays.residual_pose[indices]),
+            staleness_pose=jnp.asarray(arrays.null_pose[indices]) - reference_chunk[..., : config.pose_dims],
         )
 
         def loss_fn(module):
-            predicted, _, _ = module(
+            predicted, staleness, _, _ = module(
                 jnp.asarray(cache.context_tokens[cache.row_key_positions[indices]], dtype=jnp.float32),
                 jnp.asarray(cache.context_mask[cache.row_key_positions[indices]]),
                 jnp.asarray(arrays.force_history[indices]),
@@ -192,7 +193,10 @@ def main() -> None:
                 train=True,
             )
             assert predicted.shape == (len(indices), CHUNK_STEPS, 9)
-            return slow_fast_distillation.fast_residual_loss(predicted, reference_chunk, targets, loss_config)[0]
+            assert staleness.shape == predicted.shape
+            return slow_fast_distillation.fast_residual_loss(
+                predicted, reference_chunk, targets, loss_config, predicted_staleness=staleness
+            )[0]
 
         before = float(loss_fn(model))
         for _ in range(30):

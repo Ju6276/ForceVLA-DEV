@@ -16,11 +16,18 @@ class PairedTeacherTargets:
 
 @dataclasses.dataclass(frozen=True)
 class FastChunkTargets:
-    """Teacher targets for the short chunk Fast emits at one observation timestamp."""
+    """Teacher targets for the short chunk Fast emits at one observation timestamp.
+
+    `staleness_pose` is the only field that depends on which Slow packet the fast loop
+    happens to be riding. It is `A_null(t) - A_ref(t)`: the part of the deployed error
+    that exists purely because the cached context is older than the force and state it
+    is being combined with.
+    """
 
     full_action: jnp.ndarray
     nominal_action: jnp.ndarray
     residual_pose: jnp.ndarray
+    staleness_pose: jnp.ndarray | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -30,6 +37,10 @@ class FastDistillationLossConfig:
     pose_dims: int = 9
     residual_weight: float = 1.0
     reconstruction_weight: float = 1.0
+    # Weight on the stale-reference correction. This is the term that makes training
+    # match asynchronous deployment: without it nothing in the objective depends on how
+    # old the cached context is, and the time features are free to go unused.
+    staleness_weight: float = 1.0
     # Later steps of the emitted chunk only execute when Fast stalls or runs slower
     # than the action rate, so they are supervised but down-weighted relative to the
     # step that runs in the common case.
@@ -38,7 +49,7 @@ class FastDistillationLossConfig:
     def __post_init__(self) -> None:
         if self.pose_dims <= 0:
             raise ValueError("pose_dims must be positive")
-        if min(self.residual_weight, self.reconstruction_weight) < 0:
+        if min(self.residual_weight, self.reconstruction_weight, self.staleness_weight) < 0:
             raise ValueError("Distillation loss weights must be non-negative")
         if not 0 < self.step_decay <= 1:
             raise ValueError("step_decay must be in (0, 1]")
@@ -107,8 +118,16 @@ def fast_residual_loss(
     slow_reference,
     targets: FastChunkTargets,
     config: FastDistillationLossConfig,
+    *,
+    predicted_staleness=None,
 ):
-    """Preserve residual specialization while also reconstructing full actions."""
+    """Supervise each correction on its own target, and their sum on the executed action.
+
+    The reconstruction term is what ties the two heads to what the robot actually runs,
+    `A_ref(t) + force + staleness`. It is redundant only if both heads were exact; with
+    a weight on it the heads can trade off their individual errors so the composition
+    lands closer than either target alone would force it to.
+    """
     expected = targets.residual_pose.shape
     if len(expected) != 3:
         raise ValueError(f"Expected chunk residual [B,K,D], got {expected}")
@@ -120,14 +139,26 @@ def fast_residual_loss(
         or slow_reference.shape[-1] < config.pose_dims
     ):
         raise ValueError("Slow reference must be [B,K,A] and contain all pose dimensions")
+    if (predicted_staleness is None) != (targets.staleness_pose is None):
+        raise ValueError("A staleness prediction requires a staleness target, and vice versa")
+    if predicted_staleness is not None:
+        if predicted_staleness.shape != expected:
+            raise ValueError(f"Expected staleness prediction {expected}, got {predicted_staleness.shape}")
+        if targets.staleness_pose.shape != expected:
+            raise ValueError(f"Expected staleness target {expected}, got {targets.staleness_pose.shape}")
+
     weights = config.step_weights(expected[1])[None, :, None]
+    scale = expected[0] * expected[2]
     residual_error = jnp.square(predicted_residual - targets.residual_pose)
-    reconstructed = slow_reference[..., : config.pose_dims] + predicted_residual
+    residual_loss = jnp.sum(residual_error * weights) / scale
+
+    correction = predicted_residual if predicted_staleness is None else predicted_residual + predicted_staleness
+    reconstructed = slow_reference[..., : config.pose_dims] + correction
     reconstruction_error = jnp.square(reconstructed - targets.full_action[..., : config.pose_dims])
-    residual_loss = jnp.sum(residual_error * weights) / (expected[0] * expected[2])
-    reconstruction_loss = jnp.sum(reconstruction_error * weights) / (expected[0] * expected[2])
+    reconstruction_loss = jnp.sum(reconstruction_error * weights) / scale
+
     total = config.residual_weight * residual_loss + config.reconstruction_weight * reconstruction_loss
-    return total, {
+    metrics = {
         "residual_loss": residual_loss,
         "reconstruction_loss": reconstruction_loss,
         # The step actually executed in steady state, reported unweighted so it is
@@ -135,3 +166,10 @@ def fast_residual_loss(
         "residual_loss_step0": jnp.mean(residual_error[:, 0]),
         "reconstruction_loss_step0": jnp.mean(reconstruction_error[:, 0]),
     }
+    if predicted_staleness is not None:
+        staleness_error = jnp.square(predicted_staleness - targets.staleness_pose)
+        staleness_loss = jnp.sum(staleness_error * weights) / scale
+        total = total + config.staleness_weight * staleness_loss
+        metrics["staleness_loss"] = staleness_loss
+        metrics["staleness_loss_step0"] = jnp.mean(staleness_error[:, 0])
+    return total, metrics

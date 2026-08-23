@@ -21,7 +21,7 @@ def test_selected_fast_defaults_use_10d_state_and_100hz_force():
     assert config.force_encoder.max_history_samples == 10
 
 
-def _config(*, predict_gate: bool = False):
+def _config(*, predict_gate: bool = False, predict_staleness: bool = True):
     return slow_fast.FastResidualConfig(
         reference_dim=7,
         state_dim=8,
@@ -33,6 +33,7 @@ def _config(*, predict_gate: bool = False):
         num_kv_heads=1,
         head_dim=16,
         predict_gate=predict_gate,
+        predict_staleness=predict_staleness,
         force_encoder=force_encoder.ForceEncoderConfig(
             type="tcn",
             hidden_dims=(32, 32),
@@ -46,7 +47,7 @@ def _config(*, predict_gate: bool = False):
 
 def test_fast_residual_student_shapes_and_zero_safe_initialization():
     model = slow_fast.FastForceResidualStudent(_config(), rngs=nnx.Rngs(0))
-    residual, gate = model(
+    residual, staleness, gate = model(
         jnp.ones((2, 4, 6)),
         jnp.ones((2, 4), dtype=jnp.bool_),
         jnp.ones((2, 2, 16)),
@@ -55,9 +56,48 @@ def test_fast_residual_student_shapes_and_zero_safe_initialization():
         jnp.zeros((2, 2)),
     )
     assert residual.shape == (2, _config().chunk_steps, 6)
+    assert staleness.shape == residual.shape
     assert gate.shape == (2,)
     np.testing.assert_array_equal(residual, 0)
+    np.testing.assert_array_equal(staleness, 0)
     np.testing.assert_array_equal(gate, 1)
+
+
+def test_staleness_head_cannot_see_force_while_the_residual_head_can():
+    model = slow_fast.FastForceResidualStudent(_config(), rngs=nnx.Rngs(7))
+    # Both heads ship with a zero kernel, which would make any output insensitive to
+    # everything. Randomizing them is what makes the comparison below meaningful.
+    for head, seed in ((model.residual_head, 11), (model.staleness_head, 12)):
+        head.kernel.value = jax.random.normal(jax.random.key(seed), head.kernel.value.shape)
+
+    conditions = (
+        jnp.ones((2, 2, 16)),
+        jnp.ones((2, 8)),
+        jnp.ones((2, 7)),
+        jnp.zeros((2, 2)),
+    )
+    mask = jnp.ones((2, 4), dtype=jnp.bool_)
+    quiet_residual, quiet_staleness, _ = model(jnp.zeros((2, 4, 6)), mask, *conditions)
+    loud_residual, loud_staleness, _ = model(jnp.ones((2, 4, 6)) * 5.0, mask, *conditions)
+
+    np.testing.assert_array_equal(quiet_staleness, loud_staleness)
+    assert not np.allclose(quiet_residual, loud_residual)
+
+
+def test_single_head_config_drops_the_staleness_projection():
+    model = slow_fast.FastForceResidualStudent(_config(predict_staleness=False), rngs=nnx.Rngs(0))
+    residual, staleness, gate = model(
+        jnp.ones((2, 4, 6)),
+        jnp.ones((2, 4), dtype=jnp.bool_),
+        jnp.ones((2, 2, 16)),
+        jnp.ones((2, 8)),
+        jnp.ones((2, 7)),
+        jnp.zeros((2, 2)),
+    )
+    assert staleness is None
+    assert residual.shape == (2, _config().chunk_steps, 6)
+    assert gate.shape == (2,)
+    assert "staleness_head" not in nnx.state(model, nnx.Param)
 
 
 def test_decoder_lets_conditions_see_each_other_but_hides_the_query():
@@ -82,7 +122,7 @@ def test_decoder_lets_conditions_see_each_other_but_hides_the_query():
 
 def test_fast_residual_student_optional_gate_starts_at_half():
     model = slow_fast.FastForceResidualStudent(_config(predict_gate=True), rngs=nnx.Rngs(0))
-    residual, gate = model(
+    residual, _, gate = model(
         jnp.ones((1, 4, 6)),
         jnp.ones((1, 4), dtype=jnp.bool_),
         jnp.ones((1, 1, 16)),
@@ -129,26 +169,27 @@ def test_fast_student_single_step_loss_has_output_head_gradients():
     model = slow_fast.FastForceResidualStudent(_config(), rngs=nnx.Rngs(4))
 
     def loss_fn(candidate):
-        residual, _ = candidate(
+        residual, staleness, _ = candidate(
             jnp.ones((2, 4, 6)),
             jnp.ones((2, 4), dtype=jnp.bool_),
             jnp.ones((2, 2, 16)),
             jnp.ones((2, 8)),
             jnp.ones((2, 7)),
             jnp.zeros((2, 2)),
-        )
-        return jnp.mean(jnp.square(residual - 1))
+            )
+        return jnp.mean(jnp.square(residual - 1)) + jnp.mean(jnp.square(staleness - 1))
 
     loss, gradients = nnx.value_and_grad(loss_fn)(model)
     assert np.isfinite(loss)
     assert jax.numpy.any(gradients["residual_head"]["kernel"].value != 0)
+    assert jax.numpy.any(gradients["staleness_head"]["kernel"].value != 0)
 
 
 def test_stage5_head_projects_slow_context_and_predicts_one_step():
     model = slow_fast.FastStudentWithIntentProjector(
         _config(), slow_context_dim=24, num_intent_tokens=2, rngs=nnx.Rngs(5)
     )
-    residual, gate, intent = model(
+    residual, staleness, gate, intent = model(
         jnp.ones((2, 5, 24)),
         jnp.ones((2, 5), dtype=jnp.bool_),
         jnp.ones((2, 4, 6)),
@@ -158,6 +199,7 @@ def test_stage5_head_projects_slow_context_and_predicts_one_step():
         jnp.zeros((2, 2)),
     )
     assert residual.shape == (2, _config().chunk_steps, 6)
+    assert staleness.shape == residual.shape
     assert gate.shape == (2,)
     assert intent.shape == (2, 2, 16)
 
@@ -183,7 +225,7 @@ def test_dropping_the_reference_token_removes_its_projection():
     )
     assert model.reference_proj is None
 
-    residual, _ = model(
+    residual, _, _ = model(
         jnp.ones((2, 4, 6)),
         jnp.ones((2, 4), dtype=jnp.bool_),
         jnp.ones((2, 3, 16)),
