@@ -103,7 +103,7 @@ staleness head 作为异步部署的工程组件与消融对象，不并入新�
 
 | 不可写 | 应写 |
 |---|---|
-| 陈旧头已接近信息上限 / 信息天花板 | 线性 probe baseline 下可读性有限，真实瓶颈未定 |
+| 陈旧头已接近信息上限 / 信息天花板 | 线性 probe baseline 下可读性有限，真实瓶颈未定（脚本 `scripts/probe_staleness_linearity.py`） |
 | analytic rebase 必然恶化 18% | 训练下旋转恶化（合成旋转 RMSE +62%，3 seeds），平移基本持平 |
 | 闭式 rebase 的旋转几何只在小角度下近似成立 | 该恒等式在 xyz+6D 坐标下**精确**；实测机制是 drift-only 目标在旋转上幅度大 1.56 倍且与被减项强负相关 |
 | force-blind 是整体控制性能更好的系统 | force-blind 更好地保持 Teacher 定义的职责分解；expert 口径反向，整体优劣待真机 |
@@ -127,8 +127,38 @@ Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与�
 
 ### 未完成
 
-1. README 主配置写成 two-head，`force_only` 列为 functional ablation；
-2. 保存线性 probe 的可复现脚本与输出（表述已降级，脚本未补）。
+1. README 主配置写成 two-head，`force_only` 列为 functional ablation（Codex 称已做，未复核）。
+
+### 线性 probe 已可复现（2026-08-23，第三轮）
+
+`scripts/probe_staleness_linearity.py`，输出 `artifacts/button_fast_evaluation/staleness_linear_probe.json`。
+train 上拟合、val 上打分，ridge `1e-6` 带截距；特征为学生推理时**真实可见**的输入
+（state、当前 tick 的 reference action、time features；**不含力**，因为头是力盲的；**不含 `S_k`**）。
+train cache 全速率，按训练同一时序带（5–15 Hz / 50–300 ms）以 `--timing-seed` 重抽一次。
+
+| 特征 / 目标 | R² | 目标 RMS | 残差 RMS |
+| --- | --- | --- | --- |
+| student_visible / base_corrected（现方案） | 0.081 | 0.156 | **0.149** |
+| student_visible / drift_only（analytic rebase） | 0.347 | 0.200 | 0.160 |
+| plus_key_state / base_corrected | 0.161 | 0.156 | 0.143 |
+| plus_key_state / drift_only | 0.481 | 0.200 | 0.143 |
+
+三点结论：
+
+1. **R² 高不等于误差小。** drift_only 的 R² 是现方案的 4 倍多，但残差 RMS 反而更大
+   （0.160 vs 0.149），因为目标本身大 28%。到达机械臂的是绝对误差。这与第三轮
+   analytic rebase 的训练结果同向。
+2. **`plus_key_state` 两行的残差 RMS 完全相同**（0.1428503614，逐位一致）。这是代数必然：
+   一旦 `S_k` 进了特征，两个目标就只差特征的一个线性函数，残差必定重合。
+   **这独立复现了归档区那次自我更正**——早前"线性公式比网络好 4.6 倍"的对比正是踩了这个退化。
+3. 加入 `S_k` 使现方案目标的 R² 从 0.081 升到 0.161，即 `S_k` 确有线性可读的信息；
+   但 anchor token 实验中网络反而变差，瓶颈在泛化而非信息。
+
+与归档区那次一次性分析对比：R² 高度吻合（0.081 vs 0.0695、0.347 vs 0.3319、
+0.161 vs 0.158），残差 RMS 的**排序一致但绝对尺度不同**（归档为 0.0227 / 0.0267），
+应是当时的口径或归一化不同，已无法复原。**以本脚本输出为准**。
+
+必须随数字出现的限定：这只测**线性可读性**，不是信息上限；低值同样可能是量存在但被非线性编码。
 
 ### 两项消融的训练结果（2026-08-23，第三轮）
 
@@ -268,7 +298,8 @@ median 比值 236.7x。在 100 Hz 的 10 ms 预算下 action expert 放不进，
 - 扫描 JSON：`artifacts/button_fast_evaluation/latency_sweep{,_force_only}.json`、`sweep_*_s{1,2}.json`
   （**论文实验表格的唯一数据来源，未入 git，建议单独备份**）
 - 测试：`scripts/oracle_composition_test.py`
-- 脚本：`scripts/sweep_fast_latency.py`、`scripts/benchmark_fast_path_latency.py`
+- 脚本：`scripts/sweep_fast_latency.py`、`scripts/benchmark_fast_path_latency.py`、
+  `scripts/probe_staleness_linearity.py`（输出 `artifacts/button_fast_evaluation/staleness_linear_probe.json`）
 - 提交：`b51bb30`（本文档）、`b9cd008`（两头实现 + 测试修复）、`ef2a119`（评估工具）
 - 论文：`ICRA2027Submission` 的 `23814c4`，方法章已按当前代码重写
 
@@ -1109,5 +1140,7 @@ expert matching 为必须同表报告的行为诊断、真机为最终判据。�
 
 ### 六、未做
 
-- 线性 probe 可复现脚本仍未补（唯一剩余的非训练待办）。
+- ~~线性 probe 可复现脚本仍未补~~ **已补**：`scripts/probe_staleness_linearity.py`，
+  见上文「线性 probe 已可复现」。其中 `plus_key_state` 两行残差逐位相同，独立复现了归档区
+  那次关于退化对比的自我更正。
 - 真正的旋转群 rebase 实验（基于 `R_t R_k^{-1}`）未做，也不建议做：analytic rebase 方向已放弃。
