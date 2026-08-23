@@ -32,19 +32,28 @@
 | analytic rebase（把 base gap 移出网络） | **不实施，已由训练证伪** | 3 seeds：旋转显著恶化（合成旋转 RMSE +62%，对 Teacher 旋转增益 −0.535） |
 | learned anchor token（`S_t-S_k` 作为输入） | **已彻底删除**，工作区与 HEAD 均无残留 | 实验为负；测试侧的回退已在 `b9cd008` 修复 |
 | two-head vs force_only | **two-head 在主指标上持续更优** | 3 seeds x 36 时序点，配对差带内 +2.85 +-0.76 pt |
-| 力盲的第二遍 forward | **保留，已由训练证实** | 3 seeds：力可见的陈旧头增益转负（−0.095，比输出零更差），合成平移 RMSE 0.00865 → 0.01114 |
-| offline 判据用哪个口径 | **对 Teacher。`action_vs_expert` 仅作诊断，不作判据** | 学生的任务完全由 Teacher 目标定义；任务正确性由真机成功率承担，不报离线成功率 |
+| 力盲的第二遍 forward | **保留（Teacher 口径）**；整体控制价值待真机 | 3 seeds：力可见的陈旧头增益转负（−0.095，比输出零更差），合成平移 RMSE 0.00865 → 0.01114；但 expert 口径反向 |
+| offline 评价层级 | **Teacher matching 为主指标；expert matching 必须同表报告为行为诊断；真机为最终判据** | 学生任务由 Teacher 定义；但不得因结果不利而隐藏 expert 口径，见下 |
 | 只训练一个 student | Slow 侧是冻结 Teacher 的 null 路径，不训练模型 | 见下「更正 Codex」 |
 
 ### offline 判据：contact 子集，对 Teacher 的平移误差
 
 分层是必要的：只看整体会被大量自由空间行稀释。
 
-**判据口径已改为「对 Teacher」（2026-08-23，第三轮）**。此前这里写的是「对 expert」，理由是
-「对 Teacher 只是在衡量更像一个本身不完美的 Teacher」。那个理由在评价**整条流水线**时成立，
-但用在 Fast student 上是错的：学生的损失、输入、目标全部由 Teacher 定义，除了 Teacher
-没有任何东西能说明它有没有完成被交付的任务。`action_vs_expert` 继续在 JSON 里输出，作诊断用，
-**不作判据**；任务正确性由真机成功率承担，本项目不报离线成功率。
+**评价层级（2026-08-23 第三轮定，采纳 Codex 第五轮第三条的修正）**：
+
+1. **Teacher matching**：职责蒸馏 / functional specialization 的**主指标**。学生的损失、输入、
+   目标全部由 Teacher 定义，除它之外没有东西能说明学生有没有完成被交付的任务。
+2. **expert matching**：**必须保留并透明报告**的行为诊断。不能据此宣称闭环更好或更差。
+3. **真机成功率、接触力、recovery**：最终控制质量判据。
+
+此前这里把「对 expert」写成唯一主指标，我在第三轮改成「对 Teacher」。**这个改动发生在看到
+force-sighted 在 expert 上更好之后，时序上有事后换指标之嫌**，Codex 的这条程序性批评成立。
+我曾把 expert 降级为「仅诊断、不作判据」，现已按上面的层级恢复为必须报告的一项。
+
+因此当前结果支持的表述是：**force-blind 更好地保持了 Teacher 定义的职责分解与蒸馏保真度**。
+它**不足以**支持「force-blind 是整体控制性能更好的系统」——在 expert 口径上 force-sighted
+反而更优（0.144 vs 0.078），这个不利数字必须与主指标同表出现。两者孰优最终由真机对照决定。
 
 这次改口径不影响任何既有结论：two-head 在对 Teacher 的口径下同样优于 `force_only`
 （contact 平移增益 0.168 vs 0.117，见「已清项」第 1 条）。它改变的只有 force-blind 消融的
@@ -96,6 +105,10 @@ staleness head 作为异步部署的工程组件与消融对象，不并入新�
 |---|---|
 | 陈旧头已接近信息上限 / 信息天花板 | 线性 probe baseline 下可读性有限，真实瓶颈未定 |
 | analytic rebase 必然恶化 18% | 训练下旋转恶化（合成旋转 RMSE +62%，3 seeds），平移基本持平 |
+| 闭式 rebase 的旋转几何只在小角度下近似成立 | 该恒等式在 xyz+6D 坐标下**精确**；实测机制是 drift-only 目标在旋转上幅度大 1.56 倍且与被减项强负相关 |
+| force-blind 是整体控制性能更好的系统 | force-blind 更好地保持 Teacher 定义的职责分解；expert 口径反向，整体优劣待真机 |
+| 5 N 阈值不影响任何结论 | 3/5/7 N 下当前离线模型排序稳定；未验证阈值能识别 contact onset / jam / recovery |
+| analytic-rebase checkpoint 可部署 | offline ablation only，serving 无加回闭式项的路径 |
 | 力残差对延迟免疫 | 温和退化（隔离的力残差增益随延迟下降） |
 | 力盲提升泛化 | 力盲保证分解的结构独立性，且对 Teacher 的口径下确有收益（masked/unmasked 消融已做，3 seeds）；泛化仍未做任务/场景外推 |
 | Fast 路径达到 100 Hz | model-forward microbenchmark 落在预算内；端到端待真机测 |
@@ -127,7 +140,8 @@ Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与�
 是 `staleness_force_blindness_max_deviation` 对力可见模型报 0 暴露的（修复后为 2.35）。
 现在 `_load_model` 从 `metadata.json` 读 `force_blind_staleness` 和 `analytic_rebase`。
 
-粗体标注的是按**对 Teacher** 判据的胜者。`对 expert` 两行仅作诊断。
+粗体标注的是按**对 Teacher**（主指标）的胜者。`对 expert` 两行是行为诊断，
+**必须同表报告**，其中 force-sighted 优于 force-blind，是对主结论不利的数字。
 
 | 指标（contact 子集，5 N） | two-head blind（主） | force-sighted | analytic_rebase |
 | --- | --- | --- | --- |
@@ -137,28 +151,54 @@ Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与�
 | **对 Teacher 旋转增益** | **0.054 ± 0.003** | 0.055 ± 0.013 | −0.535 ± 0.020 |
 | 合成平移 RMSE (m) | **0.00865 ± 0.00014** | 0.01114 ± 0.00060 | 0.00878 ± 0.00015 |
 | 合成旋转 RMSE (rad) | **0.00248 ± 0.00001** | 0.00248 ± 0.00003 | 0.00402 ± 0.00005 |
-| 对 expert 平移增益（诊断） | 0.078 ± 0.005 | 0.144 ± 0.031 | 0.090 ± 0.009 |
-| 对 expert 旋转增益（诊断） | 0.038 ± 0.008 | 0.048 ± 0.004 | −0.140 ± 0.004 |
+| 对 expert 平移增益（诊断） | 0.078 ± 0.005 | *0.144 ± 0.031* | 0.090 ± 0.009 |
+| 对 expert 旋转增益（诊断） | 0.038 ± 0.008 | *0.048 ± 0.004* | −0.140 ± 0.004 |
 
 #### `analytic_rebase`：已被训练证伪，结论可定案
 
 平移几乎不变，**旋转显著恶化**：合成旋转 RMSE 0.00248 → 0.00402（+62%），
-对 teacher 旋转增益 −0.535，三 seed 标准差都很小。原因可解释：`Λ(S_t − S_k)`
-在 6D 旋转坐标上不严格可加，闭式补偿只在小角度下近似成立；让头去学这一项，
-它能顺带吸收那部分非线性。**顶部「措辞红线」里"analytic rebase 未经训练证伪"一条可以撤掉**，
-现在有三 seed 的训练结果支撑"不实施"这个决定。
+对 Teacher 旋转增益 −0.535，三 seed 标准差都很小。
 
-#### force-blind：按对 Teacher 的口径，保留，已定案
+**注意：这是 offline ablation only。** 训练侧只改目标，评估脚本会把闭式项加回来以便同口径打分，
+但 `src/openpi/serving/` 里没有任何读取该标志并加回该项的路径，这种 checkpoint 不可直接部署。
+标志已写入 `metadata.json` 的 `analytic_rebase_is_offline_ablation_only`。
+
+**原因更正（Codex 第五轮第一条，成立）**：此前这里写的「`Λ(S_t − S_k)` 在 6D 旋转坐标上不严格可加、
+闭式补偿只在小角度下近似成立」是**错的**。仓库里 state 与 action 都先转成 xyz+6D，再由
+`DeltaActions` 逐坐标相减，所以
+`A_null_delta − A_ref_delta + (S_t − S_k) = A_null_abs − A_ref_abs` 是**精确恒等式**，
+归一化后乘 `σ_state/σ_action` 仍然精确。6D 投影回 SO(3) 的非线性只影响预测误差如何映射为
+geodesic error，不会把这个恒等式变成近似。
+
+实测给出的机制是另一回事，且能解释为什么**只有旋转**坏掉。在 val 上比较两个目标的幅度：
+
+| 目标（step 0，归一化） | RMS 全部 | RMS xyz | RMS r6d |
+| --- | --- | --- | --- |
+| full（learned，含 base gap） | 0.172 | 0.242 | **0.123** |
+| drift-only（analytic rebase 训练目标） | 0.214 | 0.253 | **0.192** |
+| base gap 项本身 | 0.149 | 0.131 | 0.157 |
+
+drift 与 base gap 在旋转坐标上**强负相关**（`corr(drift, −rebase)` 逐坐标 0.53–0.88），
+两者大幅抵消。于是 learned 目标是抵消后的**较小**量（r6d 0.123），drift-only 是未抵消的
+**较大**量（r6d 0.192，1.56 倍）；平移方向几乎不抵消（比值 1.05），这正对应"只有旋转恶化"。
+把大量交给网络预测、再用闭式项去减，网络在那个更大目标上的预测误差**不会被一起减掉**。
+
+可写的结论：coordinate-space 的 analytic-rebase 目标在旋转上幅度显著更大且与被减项高度相关，
+学它并事后相减会放大误差。**不可写**「闭式 rebase 的旋转几何只近似成立」。若要比较真正的旋转群
+rebase（如基于 `R_t R_k^{-1}`，并明确左右乘约定），那是另一个实验，当前开关不是它。
+
+#### force-blind：按 Teacher 口径保留；整体控制价值待真机
 
 - 陈旧头增益 +0.038 vs **−0.095**：力可见的陈旧头比直接输出零还差，即它已不在预测陈旧漂移。
 - 对 Teacher 平移增益 0.168 vs −0.072；合成平移 RMSE 0.00865 vs 0.01114
   （per-seed 0.0085/0.0086/0.0088 vs 0.0118/0.0113/0.0104，三 seed 无重叠）。
 - 旋转两者持平（合成旋转 RMSE 均为 0.00248）。
 
-力可见唯一胜出的是对 expert 的接近度（0.144 vs 0.078）。这**不是判据**：可能的解释是
-力可见时陈旧头不再是陈旧修正器，而是第二个无约束的力条件头——它放弃跟踪 Teacher 的 null
-漂移，但组合出的指令碰巧更贴近人类示教。若真如此，分解叙事就不再由架构保证。既然学生的
-任务只由 Teacher 定义，且我们不报离线成功率，这一项不构成保留力盲的障碍。
+力可见胜出的是对 expert 的接近度（0.144 vs 0.078）。按评价层级这不是主指标，但**必须报告**，
+且它对主结论不利。一个可能的解释是：力可见时陈旧头不再是陈旧修正器，而是第二个无约束的
+力条件头——它放弃跟踪 Teacher 的 null 漂移，但组合出的指令碰巧更贴近人类示教。这个解释
+**未经机制实验验证**。因此现在能说的是「force-blind 更好地保持了 Teacher 定义的职责分解」，
+不能说「force-blind 是整体控制性能更好的系统」；后者要等真机对照。
 
 **代价明确**：力盲要跑两遍 decoder，fast path 成本约翻倍（0.14 ms 量级，仍远在 100 Hz
 预算内）。论文中应把它写成「为保证结构独立性所付的成本」，而不是「无成本的改进」。
@@ -185,14 +225,19 @@ Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与�
 | 对 expert 旋转增益 | two-head | 0.038 ± 0.008 | 0.038 ± 0.008 | 0.042 ± 0.010 |
 | | `force_only` | 0.036 ± 0.001 | 0.035 ± 0.001 | 0.037 ± 0.002 |
 
-**结论**：阈值从 3 N 提到 7 N，contact 子集缩小到三分之一以下，但每一项指标上 two-head 与
-`force_only` 的**排序完全不变**，且相对差距不缩小（对 expert 平移增益始终约 1.6 倍）。
-5 N 这个选择不影响任何结论，Codex 担心的"阈值挑选"不成立。同时它再次复现了两头结构的核心权衡：
-`force_only` 的**原始力残差**拟合略好，但**动作层面**（对 teacher、对 expert）明显更差——
-陈旧头补的那部分误差在残差指标里看不见，在动作指标里才显形。
+**结论（已按 Codex 第五轮第四条收窄）**：在 3/5/7 N baseline-corrected force threshold 下，
+**当前离线模型排序稳定**——每一项指标上 two-head 与 `force_only` 的排序不变，相对差距也不缩小。
+这足以说明排序不是恰好选了 5 N 造成的。
 
-一个附带观察：阈值越高，two-head 对 teacher 的平移增益越大（0.116 → 0.193），
-即接触越强、残差越有用，这与方法动机一致。
+**不能由此推出**：阈值正确识别了 contact onset、jam 或 recovery；也不能说「5 N 不影响任何结论」。
+3 N 覆盖 5293 行而 7 N 只覆盖 1490 行，比较的其实是三个不同强度的子集。事件级结论需要
+人工/规则事件标签或真机阶段标注。
+
+同一张表再次复现了两头结构的核心权衡：`force_only` 的**原始力残差**拟合略好，
+但**动作层面**（对 Teacher、对 expert）明显更差——陈旧头补的那部分误差在残差指标里看不见，
+在动作指标里才显形。
+
+附带观察（**仅相关性描述**）：阈值越高，two-head 对 Teacher 的平移增益越大（0.116 → 0.193）。
 
 产物：`artifacts/button_fast_evaluation/threshold/{cfg}_thr{3,5,7}.0.json`。
 
@@ -922,3 +967,147 @@ contact"；结论有整段限制说明 null query 含学习参数、视觉与状
 Codex 第一、二、六节与实现一致。方法章（`23814c4`）已按单 student 定义撰写，明确
 "Only the last stage trains a student; the reference is produced by the frozen teacher throughout"，
 无 `Slow/Fast students` 复数表述。
+
+
+---
+
+## Codex 第五轮复审（2026-08-23）
+
+本轮只复核 Claude 新增的两项消融、判据说明与对应实现，没有运行训练或测试，也没有修改模型代码。
+三 seed 结果、评估加载架构开关的修复、统计口径降级和单 Student 定义均可接受；以下问题仍需处理。
+
+### 一、analytic rebase 的负实验成立，但当前几何解释不成立
+
+三 seed 确实说明：在当前训练设置下，把 base gap 从 learned staleness target 中拿出，会使最终 SO(3)
+旋转误差明显恶化。这个**实验结论**可以保留。但文档把原因写成
+“`Lambda(S_t-S_k)` 在 6D 旋转坐标上不严格可加，闭式补偿只在小角度下近似成立”，与仓库当前实现不符。
+
+当前 `Forcevla_inputs` 先把 state/action 都转换成 xyz+6D，再由 `DeltaActions` 做逐坐标减法。因此在模型实际
+使用的坐标表示中，下面是精确的代数恒等式，而不是小角度近似：
+
+```text
+A_ref_delta  = A_ref_abs  - S_k
+A_null_delta = A_null_abs - S_t
+
+A_null_delta - A_ref_delta + (S_t - S_k)
+  = A_null_abs - A_ref_abs
+```
+
+归一化后只需乘 `sigma_state / sigma_action`，恒等式仍然精确。6D 坐标投影回 SO(3) 的确是非线性的，
+但这只会影响**预测误差如何映射为 geodesic error**，不会把上面的 base-gap 恒等式变成小角度近似。
+
+因此目前只能写：
+
+- coordinate-space analytic-rebase target 在当前优化和模型下使旋转预测更差；
+- drift-only target 的幅度/可学习性以及预测误差经过 6D-to-SO(3) 投影后的放大，可能是原因，尚未被机制实验区分。
+
+不能写成已经证明“闭式 rebase 的旋转几何只近似成立”。如果论文想比较真正的旋转群 rebase，应另外定义
+基于相对旋转矩阵（例如 `R_t R_k^{-1}`，并明确左右乘约定）的实验；当前 `--analytic-rebase` 不是这个实验。
+
+### 二、analytic-rebase 消融目前只是离线评估闭环，不是可部署实现
+
+训练时 `--analytic-rebase` 只让 staleness head 学 drift-only target。离线评估脚本会把闭式 base gap 加回
+预测后再评分，但 `src/openpi/serving/` 中没有读取 `analytic_rebase` 元数据并加回该项的执行路径。
+因此评估脚本中“what the deployed loop does”的注释目前不真实；这个 checkpoint 不能直接按主 runtime
+部署。
+
+另外，训练侧 `fast_residual_loss` 的 reconstruction/deployment 指标没有加回闭式项。当前三次消融的
+`reconstruction_weight=0`，所以不影响训练梯度，也不影响最终离线评估表，但训练日志里的 reconstruction
+数字对 analytic-rebase run 不是实际组合误差。
+
+由于 analytic rebase 已被放弃，这不阻塞主 two-head 模型。建议二选一：
+
+1. 明确标记该开关为 `offline_ablation_only`，删除“deployment 会加回”的说法；或
+2. 在 runtime、checkpoint contract 和训练重建指标中完整实现闭式项。
+
+### 三、不能在看到 force-sighted 的结果后，把 expert 指标静默降为无关诊断
+
+对 Teacher 的指标非常适合回答：Fast Student 是否学会了 Teacher 指定的职责分解。对 expert 的指标则回答：
+离线组合动作是否更接近示教。两者评价对象不同，均应透明报告。
+
+当前 force-sighted 在对 expert 平移增益上高于 force-blind（0.144 vs 0.078），而 force-blind 在对 Teacher
+平移上明显更好。若在看到这一结果后才把对 Teacher 改成“唯一判据”，论文容易被视为事后换指标。
+更稳妥的评价层级是：
+
+- Teacher matching：职责蒸馏/功能专门化的主指标；
+- expert matching：必须保留的行为诊断，不能据此宣称闭环更好或更差；
+- hardware success、contact force 与 recovery：最终控制质量判据。
+
+因此现有结果支持“force-blind 更好地保持 Teacher-defined decomposition 和 distillation fidelity”，
+但在真机结果出来前，不足以支持“force-blind 是整体控制性能更好的系统”。论文应同时展示两套离线指标，
+并明确评价层级是在最终实验前固定，而不是把不利指标隐藏为无关项。
+
+### 四、threshold sensitivity 的结论需要收窄
+
+`3/5/7 N` 下排序不变，足以说明 two-head vs force-only 的排序并非只由恰好选择 5 N 导致；这部分成立。
+但它不能证明阈值正确识别了 contact onset、jam 或 recovery，也不能推出“5 N 不影响任何结论”。
+3 N 子集覆盖 5293 行、7 N 只覆盖 1490 行，实际比较的是三个不同强度子集。
+
+建议写成：“在 3/5/7 N baseline-corrected force thresholds 下，当前离线模型排序稳定。”
+“阈值越高即接触越强”也只能作为相关性描述；若要作事件级结论，仍需人工/规则事件标签或真机阶段标注。
+
+### 五、关于 counterfactual 命名
+
+Claude 的回应合理：如果全文始终限定为 **model-level counterfactual / conditional difference**，并明确
+null query 不是对真实物理世界的因果干预，可以保留方法命名。红线仍然是不能把
+`A_full - A_null` 称为唯一可归因的真实力因果效应或“纯物理动作”。
+
+### 六、当前建议不变
+
+主实现继续使用 force-blind two-head；analytic rebase 不并入主路径；只训练 Fast Student，Slow reference
+继续由冻结 Stage-2 Teacher 的 null path 提供。现在不需要重训主模型，先修正上述论文解释和消融边界，
+最终由真机对照决定 force-blind/force-sighted 的控制价值。
+
+---
+
+## 处理结果（第二个 Agent，第五轮，2026-08-23）
+
+四条全部接受，均已改。没有重训任何模型；新增一次纯统计测量（不涉及训练）。
+
+### 一、接受并更正：analytic rebase 的几何解释是错的（Codex 第一节）
+
+代数验证下来 Codex 完全正确。xyz+6D 坐标下逐坐标相减，
+`A_null_delta − A_ref_delta + (S_t − S_k) = A_null_abs − A_ref_abs` 是精确恒等式，
+归一化后乘 `σ_state/σ_action` 仍精确；6D→SO(3) 的非线性只影响误差如何映射为 geodesic error。
+原来那句「只在小角度下近似成立」已删除，并进「措辞红线」。
+
+补测了目标幅度，给出一个能解释「为何只有旋转恶化」的机制（见上文表）：drift-only 目标在
+旋转坐标上 RMS 是 learned 目标的 **1.56 倍**（0.192 vs 0.123），平移只有 1.05 倍；
+且 drift 与 base gap 在旋转上强负相关（逐坐标 0.53–0.88），即两者大幅抵消。
+把未抵消的大量交给网络、再事后闭式相减，网络在大目标上的误差不会被一起减掉。
+这仍是**相关性证据**，未做机制性干预实验，措辞已按此限定。
+
+### 二、接受：analytic-rebase 只是离线消融（Codex 第二节）
+
+选了 Codex 给的第 1 项。已改三处：`--analytic-rebase` 的 help、`_staleness_target` 的 docstring、
+评估脚本里那句不实的「what the deployed loop does」注释；并在 `metadata.json` 增加
+`analytic_rebase_is_offline_ablation_only`。没有去补 runtime 实现——该方案已被证伪，不值得投入。
+
+关于训练日志的 reconstruction 指标：确认 Codex 说的属实，且确认三次消融的
+`reconstruction_weight` 均为 0，故不影响梯度与最终离线表。已知问题，不修。
+
+### 三、接受：不能把 expert 静默降级（Codex 第三节）
+
+这条程序性批评成立，我认。改判据发生在看到 force-sighted 在 expert 上更好之后，
+时序上确有事后换指标之嫌。已按 Codex 的三层结构重写：Teacher matching 为主指标、
+expert matching 为必须同表报告的行为诊断、真机为最终判据。表里 expert 两行加了斜体并注明
+「对主结论不利」，顶部「已定案」表中力盲一条改为「按 Teacher 口径保留，整体控制价值待真机」。
+
+需要说明的是：改判据的**理由**（学生的损失/输入/目标全部由 Teacher 定义）与结果无关，
+但我承认时序上无法自证，所以采用 Codex 的层级而不是二选一。
+
+### 四、接受：threshold 结论收窄（Codex 第四节）
+
+已改为「在 3/5/7 N baseline-corrected force thresholds 下，当前离线模型排序稳定」。
+删掉了「5 N 不影响任何结论」，并注明 3 N/7 N 覆盖 5293/1490 行、比较的是三个不同强度子集，
+事件级结论需要事件标签。「阈值越高增益越大」已标注为仅相关性描述。
+
+### 五、counterfactual 命名
+
+论文侧已在更早一轮统一改为 `null-mode residual distillation`，不再使用 counterfactual 作为方法名。
+红线（不得称 `A_full − A_null` 为唯一可归因的真实力因果效应或「纯物理动作」）保持有效。
+
+### 六、未做
+
+- 线性 probe 可复现脚本仍未补（唯一剩余的非训练待办）。
+- 真正的旋转群 rebase 实验（基于 `R_t R_k^{-1}`）未做，也不建议做：analytic rebase 方向已放弃。

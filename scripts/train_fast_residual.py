@@ -64,8 +64,8 @@ def _staleness_target(
 
     Both states are known at deployment, so the gap can also be supplied in closed
     form and dropped from what the head has to learn. `include_base_gap=False` is that
-    ablation; a run trained this way is only correct if the caller adds the term back
-    when composing the command.
+    ablation. Only the evaluation script adds the term back, so a run trained this way
+    is scoreable but not deployable.
     """
     key_rows = cache.key_dataset_indices[cache.row_key_positions[indices]]
     drift = arrays.null_pose[indices] - cache.reference_actions[indices, :, :pose_dims]
@@ -231,9 +231,11 @@ def main() -> None:
         "--analytic-rebase",
         action="store_true",
         help=(
-            "Ablation: drop the base-state gap from the staleness target and leave the "
-            "head only the unpredictable drift. Both states are known at deployment, so "
-            "the gap is added back in closed form when the command is composed."
+            "Offline ablation only: drop the base-state gap from the staleness target "
+            "and leave the head the drift alone. Both states are known at deployment so "
+            "the gap could be supplied in closed form, but only the evaluation script "
+            "adds it back; the serving runtime does not, so such a checkpoint cannot be "
+            "deployed as it stands."
         ),
     )
     parser.add_argument(
@@ -435,9 +437,11 @@ def main() -> None:
             )
         ),
         "predict_staleness": config.predict_staleness,
-        # Deployment and evaluation must add the base-state gap back in closed form for
-        # a run trained this way, so the flag has to travel with the checkpoint.
+        # Evaluation must add the base-state gap back in closed form for a run trained
+        # this way, so the flag has to travel with the checkpoint. The serving runtime
+        # has no such path, which is why these runs are offline ablations only.
         "analytic_rebase": bool(args.analytic_rebase),
+        "analytic_rebase_is_offline_ablation_only": bool(args.analytic_rebase),
         "parameter_count": parameter_count,
         "config": {**vars(config), "force_encoder": vars(config.force_encoder)},
         "loss": vars(loss_config),

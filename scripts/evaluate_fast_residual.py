@@ -492,9 +492,10 @@ def evaluate(
             arrays.null_pose[:, 0] - cache.reference_actions[:, 0, : rot.POSE_DIMS].astype(np.float32) + rebase
         )
         if analytic_rebase:
-            # This run's head was trained on the drift alone. Supplying the gap here is
-            # what the deployed loop does, and it is also what keeps the reported
-            # staleness numbers on the same target as every other run's.
+            # This run's head was trained on the drift alone, so the gap is supplied
+            # here to put its numbers on the same target as every other run's. This is
+            # an offline ablation only: nothing in `openpi.serving` reads the flag or
+            # adds this term, so such a checkpoint is not deployable as it stands.
             normalized_staleness = normalized_staleness + rebase
     physical_staleness = None if normalized_staleness is None else normalized_staleness * scale
 
