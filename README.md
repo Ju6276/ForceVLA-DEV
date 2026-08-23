@@ -293,10 +293,14 @@ python scripts/evaluate_fast_residual.py \
 ```
 
 同一条命令也会跑 force 消融（force history 置零 / 打乱），用来确认力头不是只靠 Slow
-context/state/reference 猜 residual。消融只改变力头的输出：staleness head 的输出在三种情形下必须逐位相同，
-`staleness_force_blindness_max_deviation` 报告最大偏差，不为 0 说明 force token 泄漏进了陈旧头。
+context/state/reference 猜 residual。消融只改变力头的输出：主配置下 staleness head 的输出在三种情形下
+必须逐位相同，`staleness_force_blindness_max_deviation` 报告最大偏差，不为 0 说明 force token
+泄漏进了陈旧头。**反过来，对 `--force-sighted-staleness` 训练的消融 run 该值必须非 0**；那种 run 上读到 0
+说明 checkpoint 被装进了错误的架构。
 
-head 布局从 checkpoint 自己读，不用手动指定：单头的旧 checkpoint 仍可直接评估，只是不报 staleness 项。
+head 布局和架构开关都从 run 目录的 `metadata.json` 读，不用手动指定：单头的旧 checkpoint 仍可直接评估，
+只是不报 staleness 项。`force_blind_staleness` 和 `analytic_rebase` 改变的是前向的含义而不是形状，
+漏读不会报错只会静默出错，所以它们必须随 checkpoint 一起走。
 
 `--norm-stats-dir` 是必需的，不再可省。所有 pose 量都是相对 state 的 delta，而 Slow reference 的基准是它
 所属 packet 那一行的 state、Teacher 与 expert 的基准是当前行的 state；要把它们放在一起比，必须先各自反归
@@ -336,6 +340,31 @@ python scripts/train_fast_residual.py \
     --no-staleness-head --seed=0 \
     --wandb-project=forcevla --wandb-name=button_press_fast_force_only_repro
 ```
+
+另外两个消融开关同样复用这个入口，各写到自己的空目录：
+
+| 开关 | 作用 | 状态 |
+|---|---|---|
+| `--force-sighted-staleness` | staleness head 改从共享前向读出，不再屏蔽 force token。decoder 只跑一遍，fast path 成本减半 | 已测，主配置不采用 |
+| `--analytic-rebase` | staleness 目标去掉基准修正项，头只学 drift，闭式项在合成时加回 | **offline ablation only**，见下 |
+
+`--analytic-rebase` 训练出的 checkpoint **不可部署**：只有评估脚本会把闭式项加回来以便同口径打分，
+`src/openpi/serving/` 里没有对应路径。该标志写入 `metadata.json` 的
+`analytic_rebase_is_offline_ablation_only`。
+
+陈旧目标的线性可读性基线（不需要 GPU，train 拟合 val 打分）：
+
+```bash
+python scripts/probe_staleness_linearity.py \
+    --train-targets=artifacts/button_stage3_paired_targets/train \
+    --val-targets=artifacts/button_stage3_paired_targets/val \
+    --train-slow-cache=artifacts/button_slow_cache/train.npz \
+    --val-slow-cache=artifacts/button_slow_cache/val.npz \
+    --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
+    --output=artifacts/button_fast_evaluation/staleness_linear_probe.json
+```
+
+它测的是线性可读性，不是信息上限：低值同样可能是量存在但被非线性编码。
 
 时序扫描需要 held-out 的全速率 Slow cache；普通的 `val.npz` 是一个固定低速实现，不能向上重采样：
 
@@ -429,13 +458,21 @@ Slow 观测那一行的 state `S_k` 的 delta，`A_null(t)` 是相对当前行 `
 漏掉它会让物理旋转误差相对单头基线倒退 74.85%——旋转坐标在这两行之间的变化量和参考漂移本身同量级。
 `S_k` 在部署时来自 Slow packet 的 `state_at_observation`，`to_absolute_command` 已经在用它还原绝对指令。
 
-单头训练这个和是行不通的：陈旧项的 MSE 约为力残差的十四倍，实测把 `--reconstruction-weight` 开到 0.5
-就足以让力残差保真度从 +91.8% 掉到 −18.6%（比输出零还差），同时输出幅度从 0.135 涨到 0.282——单个头
-把容量全花在了大的那一项上，力归因的消融证据随之失效。
+单头训练这个和不可行：陈旧项的 MSE 约为力残差的十四倍，实测把 `--reconstruction-weight` 开到 0.5
+就足以让力残差保真度从 +91.8% 掉到 −18.6%（比输出零还差），同时输出幅度从 0.135 涨到 0.282，力归因的
+消融证据随之失效。这是单次运行的观察；「单个头把容量全花在大的那一项上」是对它的一种解释，未做多 seed
+复核，不应作为已证明的机制引用。
 
 陈旧项与力基本无关，因此 staleness head 走第二次 decoder 前向，**force token 在 attention mask 里被屏蔽**，
-力无关性由结构保证而不是靠损失函数自觉。评估脚本会在力消融下比较两次 staleness 输出，
-`staleness_force_blindness_max_deviation` 必须为 0。`--no-staleness-head` 退回单头的旧参数结构。
+力无关性由结构保证而不是靠损失函数自觉。评估脚本会在力消融下比较两次 staleness 输出，主配置下
+`staleness_force_blindness_max_deviation` 必须为 0。代价是 decoder 要跑两遍，fast path 的计算量约翻倍。
+
+这个代价是实测值得的，但结论有边界。`--force-sighted-staleness`（共享单次前向）三 seed 对照下，
+陈旧头增益由 +0.038 转为 −0.095，即比直接输出零还差，说明它已不在预测陈旧漂移；对 Teacher 的合成平移
+RMSE 也从 0.00865 退到 0.01114。但同一组 run 在**对 expert** 的口径上反而更好，所以只能说力盲更好地保持了
+Teacher 定义的职责分解，不能说它是整体控制性能更好的系统——后者要等真机。
+
+`--no-staleness-head` 退回单头的旧参数结构。
 
 **输出短 chunk 而不是单步**，所以 Fast 的输出速率与调用速率解耦：跟得上就只执行 `k=0`，落后了就往后
 多消费几步。后面几步只在落后时才执行，因此 loss 按 `--step-decay 0.5` 几何降权。
