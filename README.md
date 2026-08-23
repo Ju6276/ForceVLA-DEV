@@ -1,8 +1,8 @@
-# Temporal ForceVLA
+# Teacher-Guided Slow–Fast ForceVLA
 
-基于 [ForceVLA](https://github.com/THUDaDa/ForceVLA) 的分支。两处改动：把 instantaneous 6D wrench 前端
-换成严格因果、按时间戳对齐的 temporal force encoder；在冻结的 Teacher 之上训练一个轻量 Fast residual
-student，由 Teacher 的 null-force 路径充当 Slow 参考。
+基于 [ForceVLA](https://github.com/THUDaDa/ForceVLA) 的分支。当前主线是在统一 force-aware Teacher 上构造
+matched full/null targets，再训练一个轻量 Fast residual student；Teacher 的 null-force 路径直接充当 Slow，
+不另训 Slow Student。Temporal force encoder 是 Teacher 的前端组件，不作为论文的独立创新点。
 
 ```text
 Stage 1  Temporal ForceVLA Teacher
@@ -16,9 +16,10 @@ Stage 4  Intent Projector + Fast force residual student
 
 ## 状态
 
-Button 的 Temporal Stage 1（40k）、Stage 2（10k）、Stage-3 targets、Slow cache 和 Fast Student（10k）
-已经完成一次真实离线流程；尚未做真机验证。正在补与 Temporal 完全同 split、动作表示和训练 schedule 的
-instantaneous ForceVLA 40k 公平基线。旧的 Euler-angle checkpoint 不兼容当前 6D 连续旋转布局，不应复用。
+Button 的 Stage 1 Teacher（40k）、Stage 2（10k）、Stage-3 targets、Slow cache 和 Fast Student（10k）
+已经完成一次真实离线流程；尚未做真机验证。instantaneous/native-instantaneous 仅保留为可选的 Teacher
+前端 sanity ablation，不是运行主流程的前置条件。旧的 Euler-angle checkpoint 不兼容当前 6D 连续旋转布局，
+不应复用。
 
 `assets/`、`checkpoints/`、`artifacts/`、`wandb/`、`data/` 均被 Git 忽略，仓库里只有代码。
 
@@ -33,6 +34,10 @@ git submodule update --init lerobot dlimp   # 忘了 --recurse-submodules 时补
 python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 pip install -e . && pip install -e lerobot && pip install -e packages/openpi-client
+
+# 每个新终端都执行；后续命令默认从仓库根目录运行。
+source .venv/bin/activate
+export PYTHONPATH="$PWD/src:$PWD/flaxformer${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 `lerobot` 与 `dlimp` 是 submodule，pin 在 `.gitmodules`；`flaxformer` 直接 vendored 在仓库里，不用装，但
@@ -41,8 +46,8 @@ pip install -e . && pip install -e lerobot && pip install -e packages/openpi-cli
 跑测试：
 
 ```bash
-PYTHONPATH=$PWD/src:$PWD/flaxformer python -m pytest src/openpi -q
-PYTHONPATH=$PWD/src:$PWD/flaxformer python scripts/smoke_fast_pipeline.py
+python -m pytest -q
+python scripts/smoke_fast_pipeline.py
 ```
 
 ## 数据布局
@@ -81,25 +86,32 @@ Stage 2 各一份；val config 显式指向 Stage 1 的目录，不需要自己�
 
 ```bash
 python scripts/compute_norm_stats.py --config-name forcevla_button_temporal_100hz
-python scripts/compute_norm_stats.py --config-name forcevla_button_instantaneous
 
 SRC=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56
 mkdir -p assets/forcevla_button_temporal_stage2_null_bc
 cp -r "$SRC" assets/forcevla_button_temporal_stage2_null_bc/
 ```
 
+只有运行可选 instantaneous 消融时，才需要额外执行：
+
+```bash
+python scripts/compute_norm_stats.py --config-name forcevla_button_instantaneous
+```
+
 `forcevla_button_native_instantaneous_100hz` 故意直接复用 Temporal 的 train56 norm stats，保证它和 TCN
 看到的 sidecar wrench 使用完全相同的归一化；不要为它单独重算统计量。
 
-### 2. Stage 1：Temporal Teacher
+### 2. Stage 1：Unified Force-Aware Teacher
 
 ```bash
 WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_button_temporal_100hz \
-    --exp-name=button_press_temporal_100hz --overwrite --batch_size=4
+    --exp-name=button_press_temporal_100hz --overwrite --batch-size=4
 ```
 
-### 2b. Stage 1 对照：instantaneous ForceVLA
+`--overwrite` 会重建同名实验目录；要继续已有训练应改用 `--resume`，两者不要同时传。
+
+### 2b. 可选 Teacher 前端消融：instantaneous ForceVLA
 
 这是原 ForceVLA 的当前 6D wrench 前端 `state[10:16] → Linear(6, 2048)`，不读取高频 sidecar。除 force
 encoder 外，它与上面的 Temporal Teacher 使用相同 56/10 split、Pi0 base 权重、6D action、LoRA/freeze
@@ -108,10 +120,10 @@ filter、batch size、40k steps 和 20k 保存间隔。
 ```bash
 WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_button_instantaneous \
-    --exp-name=button_press_instantaneous_40k --overwrite --batch_size=4
+    --exp-name=button_press_instantaneous_40k --overwrite --batch-size=4
 ```
 
-### 2c. Stage 1 严格对照：native instantaneous（已配置，按需启动）
+### 2c. 可选同源消融：native instantaneous（已配置，按需启动）
 
 这个配置与 Temporal 使用同一份100 Hz timestamp sidecar、同一个 `(t-100 ms, t]` 的 `10×6` 因果窗口、
 12 ms freshness mask 和同一份 train56 norm stats，但只读取窗口最后的当前槽位：
@@ -126,7 +138,7 @@ latest causal 6D wrench at t -> original force_in_proj Linear(6, 2048) -> one fo
 ```bash
 WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_button_native_instantaneous_100hz \
-    --exp-name=button_press_native_instantaneous_100hz_40k --overwrite --batch_size=4
+    --exp-name=button_press_native_instantaneous_100hz_40k --overwrite --batch-size=4
 ```
 
 训练结束后的同口径评估命令是：
@@ -173,7 +185,7 @@ python scripts/evaluate_forcevla_checkpoint.py \
 ```bash
 WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py forcevla_button_temporal_stage2_null_bc \
-    --exp-name=button_press_stage2_null_bc --overwrite --batch_size=4
+    --exp-name=button_press_stage2_null_bc --overwrite --batch-size=4
 ```
 
 ### 4. Stage 3：matched full/null targets
@@ -187,17 +199,19 @@ CKPT=checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_nul
 python scripts/extract_forcevla_paired_targets.py \
     --config-name=forcevla_button_temporal_stage2_null_bc \
     --data-config-name=forcevla_button_temporal_stage2_null_bc \
-    --checkpoint=$CKPT --output-dir=artifacts/button_stage3_paired_targets/train
+    --checkpoint=$CKPT --output-dir=artifacts/button_stage3_paired_targets/train \
+    --seed=0
 
 python scripts/extract_forcevla_paired_targets.py \
     --config-name=forcevla_button_temporal_stage2_null_bc \
     --data-config-name=forcevla_button_temporal_100hz_val \
-    --checkpoint=$CKPT --output-dir=artifacts/button_stage3_paired_targets/val
+    --checkpoint=$CKPT --output-dir=artifacts/button_stage3_paired_targets/val \
+    --seed=0
 ```
 
 **先看这一步的 summary 再往下走。** `normalized_full_vs_expert_mse` 与 `normalized_null_vs_expert_mse`
-的相对差就是力条件带来的全部收益，也是 Fast 的信号上限。这个差只有个位数百分比的话，后面 Stage 4 能拿
-到的收益同样有限，值得先停下来查为什么力条件没起作用。
+的相对差用于确认 full/null 路径是否产生了非退化、接触相关的教师信号；它不是 Fast 性能的严格上界，也不
+等同于真实控制收益。如果两条路径几乎重合，应先检查 Stage 2 和 force conditioning，再训练 Fast。
 
 两个指标都按 `all` / `xyz` / `rotation_6d` / `gripper` 分组给出，且只统计前 10 个真实机器人维度——模型
 输出宽 32 维，其余 22 维是 padding，把它们平均进去会把误差和收益一起拉向 0。分组读法：力条件主要该体现
@@ -216,19 +230,21 @@ train cache 上的 `--update-jitter-ms` 不用管：cache 会同时存下未抖�
 网格重新抽一次抖动，不会在 cache 已有的抖动上再叠一次。
 
 ```bash
+CKPT=checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_null_bc/9999
+
 python scripts/extract_slow_cache.py \
     --config-name=forcevla_button_temporal_stage2_null_bc \
     --data-config-name=forcevla_button_temporal_stage2_null_bc \
     --stage3-dir=artifacts/button_stage3_paired_targets/train \
     --checkpoint=$CKPT --slow-rate-hz 0 \
-    --output=artifacts/button_slow_cache/train.npz
+    --output=artifacts/button_slow_cache/train.npz --seed=0
 
 python scripts/extract_slow_cache.py \
     --config-name=forcevla_button_temporal_stage2_null_bc \
     --data-config-name=forcevla_button_temporal_100hz_val \
     --stage3-dir=artifacts/button_stage3_paired_targets/val \
     --checkpoint=$CKPT \
-    --output=artifacts/button_slow_cache/val.npz
+    --output=artifacts/button_slow_cache/val.npz --seed=0
 ```
 
 检查 val summary 的 `time_features`：`saturated_age_fraction` 应为 0，`alpha_interior_fraction` 应明显
@@ -236,7 +252,12 @@ python scripts/extract_slow_cache.py \
 
 ### 6. Stage 4：训练 Fast residual
 
+`train_fast_residual.py` 会拒绝写入非空目录，防止覆盖旧 checkpoint。每次正式重跑都给 `FAST_RUN` 一个新的
+目录名；下面的训练、评估和部署必须使用同一个目录。
+
 ```bash
+FAST_RUN=checkpoints/fast_residual_twohead_repro
+
 WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train_fast_residual.py \
     --train-targets=artifacts/button_stage3_paired_targets/train \
@@ -244,10 +265,12 @@ python scripts/train_fast_residual.py \
     --train-slow-cache=artifacts/button_slow_cache/train.npz \
     --val-slow-cache=artifacts/button_slow_cache/val.npz \
     --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
-    --output-dir=checkpoints/button_press_fast_residual \
+    --output-dir=$FAST_RUN \
     --steps=10000 --batch-size=64 \
     --chunk-steps=5 --timing-resample-interval=500 \
-    --staleness-weight=1.0
+    --slow-rate-hz 5 15 --slow-latency-ms 50 300 \
+    --staleness-weight=1.0 --seed=0 \
+    --wandb-project=forcevla --wandb-name=button_press_fast_twohead_repro
 ```
 
 W&B 的 `timing/*` 记录每次重抽后的 `ready_row_fraction`、`mean_normalized_age` 和
@@ -257,10 +280,13 @@ W&B 的 `timing/*` 记录每次重抽后的 `ready_row_fraction`、`mean_normali
 ### 7. held-out 评估
 
 ```bash
+# 若这是新终端，设成训练时使用的同一目录。
+FAST_RUN=checkpoints/fast_residual_twohead_repro
+
 python scripts/evaluate_fast_residual.py \
     --targets=artifacts/button_stage3_paired_targets/val \
     --slow-cache=artifacts/button_slow_cache/val.npz \
-    --checkpoint=checkpoints/button_press_fast_residual/step-10000/params \
+    --checkpoint=$FAST_RUN/step-10000/params \
     --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
     --contact-threshold-n=5.0 \
     --output=artifacts/button_fast_evaluation/val.json
@@ -288,6 +314,55 @@ head 布局从 checkpoint 自己读，不用手动指定：单头的旧 checkpoi
 - 分平移 / 测地线旋转的物理误差。报告不再给出把 xyz 米和无量纲 6D 坐标混在一起的总体 pose MSE；
   `rotation_6d_coordinate_rmse` 只作表示诊断，模型排序看 `translation_rmse_m` 和
   `rotation_geodesic_rmse_rad`。
+
+### 8. 可选消融与离线时序扫描
+
+`force_only` 使用同一训练入口，只关闭 staleness head；必须写到另一个空目录：
+
+```bash
+FORCE_ONLY_RUN=checkpoints/fast_residual_force_only_repro
+
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+python scripts/train_fast_residual.py \
+    --train-targets=artifacts/button_stage3_paired_targets/train \
+    --val-targets=artifacts/button_stage3_paired_targets/val \
+    --train-slow-cache=artifacts/button_slow_cache/train.npz \
+    --val-slow-cache=artifacts/button_slow_cache/val.npz \
+    --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
+    --output-dir=$FORCE_ONLY_RUN \
+    --steps=10000 --batch-size=64 --chunk-steps=5 \
+    --timing-resample-interval=500 \
+    --slow-rate-hz 5 15 --slow-latency-ms 50 300 \
+    --no-staleness-head --seed=0 \
+    --wandb-project=forcevla --wandb-name=button_press_fast_force_only_repro
+```
+
+时序扫描需要 held-out 的全速率 Slow cache；普通的 `val.npz` 是一个固定低速实现，不能向上重采样：
+
+```bash
+CKPT=checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_null_bc/9999
+FAST_RUN=checkpoints/fast_residual_twohead_repro
+
+python scripts/extract_slow_cache.py \
+    --config-name=forcevla_button_temporal_stage2_null_bc \
+    --data-config-name=forcevla_button_temporal_100hz_val \
+    --stage3-dir=artifacts/button_stage3_paired_targets/val \
+    --checkpoint=$CKPT --slow-rate-hz 0 \
+    --output=artifacts/button_slow_cache/val_fullrate.npz --seed=0
+
+python scripts/sweep_fast_latency.py \
+    --targets=artifacts/button_stage3_paired_targets/val \
+    --slow-cache=artifacts/button_slow_cache/val_fullrate.npz \
+    --checkpoint=$FAST_RUN/step-10000/params \
+    --fast-run=$FAST_RUN \
+    --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
+    --slow-rate-hz 3 5 10 15 20 30 \
+    --slow-latency-ms 50 150 300 450 600 800 \
+    --contact-threshold-n=5.0 \
+    --output=artifacts/button_fast_evaluation/latency_sweep_repro.json
+
+python scripts/benchmark_fast_path_latency.py --budget-hz=100 --repeats=200
+```
 
 ## 设计要点
 
@@ -318,7 +393,8 @@ Conv1D 只做左侧 padding，永远不会读到未来的力。窗口是物理�
 `force_history_mask` 里标为 invalid。Button 用 `100 Hz × 100 ms` = 10 个 6D slot。换力传感器频率不需要
 改代码。
 
-`ForceEncoderConfig.type` 只保留 `instantaneous`（原始 ForceVLA）和 `tcn`（当前 Teacher）。
+主流程使用 `tcn`；`instantaneous`（原始 ForceVLA）和 `native_instantaneous`（同源最新单点）只用于可选
+Teacher 前端消融。
 
 ### Fast residual student
 
@@ -401,6 +477,10 @@ cache 存在的唯一理由，是让 Fast 训练时看到的 packet 结构和运
 `slow_fast_deploy` 固化了两边必须一致的东西：动作截到 `ROBOT_DIMS`、prefix pool 成相同 bin 数、state
 必须先转成 6D、state 与 force history 都要按训练 norm stats 归一化。
 
+下面是机器人侧的**接口接线模板，不是可直接执行的 launcher**。仓库目前没有 Button 真机的一键启动脚本；
+`read_robot`、`read_latest_robot_state`、`teacher`、`student`、`force_buffer` 和 `send_robot_command` 必须由
+具体机器人驱动提供。离线训练与评估应使用上面的命令，不要把该模板误当成已完成的硬件部署入口。
+
 ```python
 import time
 
@@ -408,7 +488,7 @@ from openpi.serving import slow_fast_deploy, slow_fast_loop, slow_fast_runtime
 
 contract = slow_fast_deploy.load_contract(
     "artifacts/button_slow_cache/train.npz",
-    fast_run="checkpoints/button_press_fast_residual",  # 时序带来自训练 run，不是 cache
+    fast_run="checkpoints/fast_residual_twohead_repro",  # 必须与 Stage 4 的 FAST_RUN 一致
 )
 build_packet = slow_fast_deploy.SlowPacketBuilder(contract)
 # state 和 force history 都归一化；力传感器的原始牛顿值不能直接喂 Fast。
@@ -510,6 +590,6 @@ project 均为 `forcevla`。
 
 ## 尚未证明的事
 
-本仓库尚不宣称 Temporal 优于 Instantaneous；必须等上面的公平 baseline 完成 held-out 对比。非零的
+Temporal 与 Instantaneous 的优劣不是当前论文主张，相关配置只保留为可选 Teacher 前端消融。非零的
 `A_full - A_null` 本身也不等于已证明有效控制分解。当前 Slow/Fast 有真实离线 held-out 结果，但最终结论仍
 需要真机实验。
