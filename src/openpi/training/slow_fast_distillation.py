@@ -19,9 +19,13 @@ class FastChunkTargets:
     """Teacher targets for the short chunk Fast emits at one observation timestamp.
 
     `staleness_pose` is the only field that depends on which Slow packet the fast loop
-    happens to be riding. It is `A_null(t) - A_ref(t)`: the part of the deployed error
-    that exists purely because the cached context is older than the force and state it
-    is being combined with.
+    happens to be riding: the part of the deployed error that exists purely because the
+    cached context is older than the force and state it is being combined with. It is
+    `A_null(t) - A_ref(t) + (sigma_state/sigma_action) * (S_t - S_key)`. The trailing
+    term is not optional. `A_ref` is a delta from the state of the row the Slow packet
+    was keyed on while `A_null(t)` is a delta from the current row's state, so without
+    it the difference is measured between two different origins and its rotation part
+    is almost entirely wrong.
     """
 
     full_action: jnp.ndarray

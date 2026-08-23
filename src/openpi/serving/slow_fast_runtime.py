@@ -189,11 +189,11 @@ def compose_reference_residual(
     """Add only pose corrections; gripper and padding remain Slow-owned.
 
     The two corrections are clipped and gated separately on purpose. `residual_limit`
-    is a safety cap on how far contact is allowed to push the arm off the plan, while
-    the staleness correction only walks the reference forward to the present and is
-    routinely the larger of the two. Sharing one cap would silently throttle the
-    staleness head down to a force-sized budget, and gating the staleness term would
-    mean "distrust the force reading" also decides to act on an out-of-date plan.
+    caps how far contact is allowed to push the arm off the plan, while `staleness_limit`
+    caps how far the cached plan is walked forward to the present. The two bound
+    different quantities, so sharing one cap ties the staleness correction to a budget
+    chosen for force, and gating the staleness term would make "distrust the force
+    reading" also decide whether to act on an out-of-date plan.
     """
     reference = np.asarray(reference_actions)
     residual = np.asarray(residual_pose)
