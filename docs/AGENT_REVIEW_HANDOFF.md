@@ -103,12 +103,58 @@ Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与�
 
 1. README 主配置写成 two-head，`force_only` 列为 functional ablation；
 2. 保存线性 probe 的可复现脚本与输出（表述已降级，脚本未补）；
-3. `3/5/7 N` contact threshold 敏感性；
-4. force-blind vs force-sighted staleness head 消融（需先加开关）；
-5. 训练 `analytic_rebase_only` 以真正证伪；
-6. latency 统一表述为 model-forward microbenchmark，注明 GPU/dtype/batch/warmup；
-7. 测试数口径统一：三方曾报 76/74/73。建议统一跑 `pytest`
-   （`testpaths = ["src","scripts","packages"]`）并引用该数字。当前 slow/fast 相关子集为 73 passed。
+3. force-blind vs force-sighted staleness head 消融（需先加开关，需训练）；
+4. 训练 `analytic_rebase_only` 以真正证伪（需训练）。
+
+### 已清项（2026-08-23，第三轮）
+
+#### 1. `3/5/7 N` contact threshold 敏感性：主指标不是挑出来的
+
+六个 checkpoint（two-head 与 `force_only` 各三 seed）在同一 val 缓存、标准时序下按
+3/5/7 N 各评一次，共 18 次。`+/-` 为三 seed 的样本标准差。
+
+| 指标（contact 子集） | 配置 | 3 N | 5 N | 7 N |
+| --- | --- | --- | --- | --- |
+| 子集行数 | 两者相同 | 5293 | 2446 | 1490 |
+| 力残差增益（full） | two-head | 0.911 ± 0.005 | 0.911 ± 0.007 | 0.919 ± 0.007 |
+| | `force_only` | **0.918 ± 0.003** | **0.917 ± 0.003** | **0.925 ± 0.004** |
+| 对 teacher 平移增益 | two-head | **0.116 ± 0.020** | **0.168 ± 0.014** | **0.193 ± 0.017** |
+| | `force_only` | 0.089 ± 0.002 | 0.117 ± 0.002 | 0.146 ± 0.003 |
+| 对 expert 平移增益 | two-head | **0.072 ± 0.004** | **0.078 ± 0.005** | **0.074 ± 0.006** |
+| | `force_only` | 0.045 ± 0.000 | 0.047 ± 0.000 | 0.046 ± 0.001 |
+| 对 expert 旋转增益 | two-head | 0.038 ± 0.008 | 0.038 ± 0.008 | 0.042 ± 0.010 |
+| | `force_only` | 0.036 ± 0.001 | 0.035 ± 0.001 | 0.037 ± 0.002 |
+
+**结论**：阈值从 3 N 提到 7 N，contact 子集缩小到三分之一以下，但每一项指标上 two-head 与
+`force_only` 的**排序完全不变**，且相对差距不缩小（对 expert 平移增益始终约 1.6 倍）。
+5 N 这个选择不影响任何结论，Codex 担心的"阈值挑选"不成立。同时它再次复现了两头结构的核心权衡：
+`force_only` 的**原始力残差**拟合略好，但**动作层面**（对 teacher、对 expert）明显更差——
+陈旧头补的那部分误差在残差指标里看不见，在动作指标里才显形。
+
+一个附带观察：阈值越高，two-head 对 teacher 的平移增益越大（0.116 → 0.193），
+即接触越强、残差越有用，这与方法动机一致。
+
+产物：`artifacts/button_fast_evaluation/threshold/{cfg}_thr{3,5,7}.0.json`。
+
+#### 2. latency 数字的口径与硬件元信息
+
+`scripts/benchmark_fast_path_latency.py --repeats=200`，RTX 4090 D / 驱动 580.173.02 /
+JAX 0.5.3 / batch 1 / 默认 dtype / 脚本内含 warmup 与 `jax.block_until_ready`。
+它测的是**单次模型前向的 microbenchmark**，不含相机、序列化或控制栈开销，论文中必须这样表述，
+不能写成端到端控制频率。
+
+| 路径 | 参数量 | median | p95 |
+| --- | --- | --- | --- |
+| cached-prefix action expert（10 flow steps） | 333.7 M | 32.30 ms（31.0 Hz） | 33.83 ms |
+| Fast residual student | 44.7 M | 0.14 ms（7329 Hz） | 0.31 ms |
+
+median 比值 236.7x。在 100 Hz 的 10 ms 预算下 action expert 放不进，Fast student 放得进。
+
+#### 3. 测试数口径：195
+
+三方之前报的 76/74/73 都是 slow/fast 相关子集。仓库根目录跑全量
+`pytest -q`（`testpaths = ["src","scripts","packages"]`）为 **195 passed**，
+应统一引用这个数字；slow/fast 子集 73 可作为附注。
 
 ### 产物索引
 
