@@ -112,6 +112,7 @@ staleness head 作为异步部署的工程组件与消融对象，不并入新�
 | 力残差对延迟免疫 | 温和退化（隔离的力残差增益随延迟下降） |
 | 力盲提升泛化 | 力盲保证分解的结构独立性，且对 Teacher 的口径下确有收益（masked/unmasked 消融已做，3 seeds）；泛化仍未做任务/场景外推 |
 | Fast 路径达到 100 Hz | model-forward microbenchmark 落在预算内；端到端待真机测 |
+| 共享噪声的配对采样是本文设计 | **既有技术**（paired sampling / common random numbers），只可写为"沿用"，不可计入贡献 |
 | 两个头在真实接触控制中必需 | two-head 在当前离线验证上持续优于 force-only |
 | latency sweep 证明泛化 | 同一批 held-out episode 上的**离线时序外推**，非任务/场景外推，非闭环 |
 | Slow/Fast students（复数） | 只训练一个 student |
@@ -320,6 +321,41 @@ median 比值 236.7x。在 100 Hz 的 10 ms 预算下 action expert 放不进，
 三方之前报的 76/74/73 都是 slow/fast 相关子集。仓库根目录跑全量
 `pytest -q`（`testpaths = ["src","scripts","packages"]`）为 **195 passed**，
 应统一引用这个数字；slow/fast 子集 73 可作为附注。
+
+### 两条补充记录（2026-08-23，用户提问引出）
+
+#### 1. 共享噪声是既有技术，不可计入贡献
+
+`sample_paired_actions_and_context` 把同一个 `rng` 传给 full 与 null 两条路径，flow ODE 在给定噪声后
+确定，故两次输出的唯一差别是力条件。这是标准做法：在扩散/流模型里固定种子做受控对比是通用实践，
+针对处理效应估计的版本一般称 **paired sampling**（对应 unpaired / independent sampling）。
+可引的近例是气候模拟技术报告 [arXiv:2511.22970](https://arxiv.org/abs/2511.22970)，它并列定义两者，
+并报告单个 paired 样本的精度约等于 241 个 unpaired 样本。
+
+**论文写法**：作为方差缩减的既有手段"沿用"，不作为新颖性；已进「措辞红线」。
+**未做**：independent-noise 对照（方向已知，用户判断不必补）。若审稿人追问"残差里多少是力效应、
+多少是采样噪声"，最省的答法是 **null-vs-null 对照**——同一样本同一 null 条件换两份噪声各采一次，
+比较 `A_null(ξ₁) − A_null(ξ₂)` 与 `A_full − A_null` 的幅度。当前**未做**，不要预设结论。
+
+#### 2. Slow context 在 fast path 的开销，以及 benchmark 的一处口径偏差
+
+缓存的 context 是 16×2048，每 tick 过一次 `intent_projector` 压成 2 个 intent token。
+实测（RTX 4090 D / batch 1 / 400 次 / 含 warmup，与 latency 表同机同口径）：
+
+| 路径 | median | p95 |
+| --- | --- | --- |
+| 完整前向（每 tick 重算投影） | 0.096 ms | 0.132 ms |
+| 投影器单独 | 0.017 ms | 0.034 ms |
+| 仅学生（intent 按 Slow 包缓存） | 0.091 ms | 0.177 ms |
+
+投影器约占一个 tick 的 5%，按 packet 缓存最多省 0.005 ms。**结论：不做这个优化**，
+省下的量远不抵"按 packet 版本失效缓存"带来的复杂度与出错面。该规模下瓶颈是 kernel 启动开销而非算力
+（投影器约 34 MFLOPs）。参数上投影器 2.1 M / 全模型 44.7 M，占比与耗时一致。
+
+**口径偏差（待修）**：`scripts/benchmark_fast_path_latency.py` 把 `--context-tokens`（默认 16）
+同时用作输入 context 长度**和** `num_intent_tokens`，而实际模型是 16 进 **2** 出。
+故 benchmark 建的 decoder 序列比真实配置长，报出的 `0.14 ms` 是**偏保守**的。
+方向不受影响，但引用该数字时应知道这一点。
 
 ### 产物索引
 
