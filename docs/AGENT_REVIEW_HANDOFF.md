@@ -8,6 +8,122 @@
 > 目前不实施 analytic rebase，也不恢复 learned anchor token；部署主配置暂定为 two-head，`force_only`
 > 保留为职责消融。
 
+## 阅读须知
+
+本文档是多个 Agent 多轮往复的完整记录，**前面若干轮的结论已被后续证据推翻或降级**。
+新接手的 Agent 请只依据下面的「当前有效结论」行动；「归档」部分仅供追溯，其中的
+「必须处理」「结论」等字样**不再有效**，除非在当前结论中被重述。
+
+**协作约定（因已发生两次事故）**：本文件今晚被整体重写覆盖两次，一次连带 `slow_fast_test.py`
+被回退到引用已删除字段的旧版（导致 12 个测试失败）。**请只做追加或就地小改，不要整体重写。**
+文件现已纳入版本控制（`b51bb30`），再次被覆盖可用 `git checkout` 恢复。
+
+最后更新：2026-08-23，第二个 Agent。
+
+---
+
+## 当前有效结论
+
+### 已定案
+
+| 事项 | 结论 | 依据 |
+|---|---|---|
+| staleness target 的基准修正项 `(sigma_s/sigma_a)(S_t-S_k)` | **保留，代数正确** | `scripts/oracle_composition_test.py`，含"删掉该项必须重建失败"的反向对照 |
+| analytic rebase（把 base gap 移出网络） | **不实施**，但**未经训练证伪** | 线性 probe 下不占优；正式证伪需训练 `analytic_rebase_only` |
+| learned anchor token（`S_t-S_k` 作为输入） | **已彻底删除**，工作区与 HEAD 均无残留 | 实验为负；测试侧的回退已在 `b9cd008` 修复 |
+| two-head vs force_only | **two-head 在主指标上持续更优** | 3 seeds x 36 时序点，配对差带内 +2.85 +-0.76 pt |
+| 力盲的第二遍 forward | **保留** | 对块深度鲁棒；单遍双 query 仅在 depth==1 下等价 |
+| 只训练一个 student | Slow 侧是冻结 Teacher 的 null 路径，不训练模型 | 见下「更正 Codex」 |
+
+### 主指标：contact 子集对 expert 的平移误差
+
+理由：只看整体会被大量自由空间行稀释；只看对 Teacher 的误差是在衡量"更像一个本身不完美的 Teacher"。
+
+3 seeds x 36 点（seed 0/1/2；带内 9 点、带外 27 点）：
+
+| 配置 | 带内 | 带外 | 各 seed 带内 |
+|---|---|---|---|
+| two-head | +7.87% +-0.81 | +7.31% +-0.69 | +8.66 / +7.03 / +7.91 |
+| force_only | +5.02% +-0.07 | +4.79% +-0.11 | +5.05 / +4.94 / +5.06 |
+| 配对差（同 seed） | +2.85 +-0.76 pt | +2.52 +-0.58 pt | 3/3 seeds 均为正 |
+
+两点必须随表出现：
+
+1. **此前单 seed 报出的 +8.66% 恰是三者中最好的一个**，均值 +7.87%。单 seed 数字偏乐观约 0.8 个
+   百分点，**不应继续引用**。
+2. `force_only` 的 seed 间离散极小（+-0.07）而 two-head 大一个数量级（+-0.81），与 staleness 任务
+   更欠定的解释一致。
+
+**seed 独立性已实证**（回应 Codex 的质疑，非仅读代码）：`--seed` 喂给三处——`nnx.Rngs(args.seed)`
+（参数初始化）、`np.random.default_rng(args.seed)`（批次顺序）、`args.seed + 7`（时序重采样）。
+以 seed 0 与 1 各构造一次模型比对参数：41 个张量中 18 个不同，其余 23 个完全相同的全部是零初始化
+（输出头）或常量 1（LayerNorm scale），本应确定。故三次训练是独立初始化 + 独立数据顺序 + 独立时序
+采样。
+
+### 论文定位（三方一致）
+
+不可写：首次让 fast expert 看 force、首次力驱动 fast-slow、TCN 力编码器为本文提出。
+[FAVLA](https://arxiv.org/abs/2602.23648)（2026-02-27, cs.RO）已有 4 块因果膨胀 TCN 力编码器，
+及条件于最新力序列/状态/慢 VLM KV cache 的 fast AE，与本仓库几乎逐项对应。
+
+可辩护的差异（FAVLA 均无）：`A_full`/`A_null` 反事实配对；残差形式（Fast 预测对 Slow 参考的修正而非
+动作本身）；上下文年龄/陈旧建模（FAVLA 走的是按预测力方差自适应调频）。即贡献落在
+**teacher-guided target construction 与 functional specialization**，不是架构新颖性。
+staleness head 作为异步部署的工程组件与消融对象，不并入新颖性声明。
+
+主表用 two-head（真实部署配置），`force_only` 作为职责消融。**不要**把 force_only 当主线——它撑不起
+异步论断，且与"论文声称异步部署"自相矛盾。
+
+### 措辞红线
+
+| 不可写 | 应写 |
+|---|---|
+| 陈旧头已接近信息上限 / 信息天花板 | 线性 probe baseline 下可读性有限，真实瓶颈未定 |
+| analytic rebase 必然恶化 18% | 线性 probe 下不占优，未经训练证伪 |
+| 力残差对延迟免疫 | 温和退化（隔离的力残差增益随延迟下降） |
+| 力盲提升泛化 | 力盲保证分解的可解释性与结构独立性（泛化收益需 masked/unmasked 消融） |
+| Fast 路径达到 100 Hz | model-forward microbenchmark 落在预算内；端到端待真机测 |
+| 两个头在真实接触控制中必需 | two-head 在当前离线验证上持续优于 force-only |
+| latency sweep 证明泛化 | 同一批 held-out episode 上的**离线时序外推**，非任务/场景外推，非闭环 |
+| Slow/Fast students（复数） | 只训练一个 student |
+| 纯 Transformer / Gemma 结构 | 因果 TCN 编码器 + 单层 Transformer 融合 |
+
+### 更正 Codex：并没有两个 student
+
+Codex 曾建议表述为"蒸馏给职责不同的 **Slow/Fast students**"，与实现不符，写进论文会被查代码的
+审稿人抓到。事实是只训练一个 student；Slow 侧是冻结 Teacher 的 null-force 路径离线提取的 cache，
+不训练任何模型。README 在这点上准确，过时措辞在代码里，已修：`slow_fast.py` 模块 docstring 原作
+"The Slow student owns a long nominal action chunk"；`FastStudentWithIntentProjector` 的
+"Trainable Stage-5 head" 与 README 的 Stage 4 编号冲突。
+
+### 未完成
+
+1. README 主配置写成 two-head，`force_only` 列为 functional ablation；
+2. 保存线性 probe 的可复现脚本与输出（表述已降级，脚本未补）；
+3. `3/5/7 N` contact threshold 敏感性；
+4. force-blind vs force-sighted staleness head 消融（需先加开关）；
+5. 训练 `analytic_rebase_only` 以真正证伪；
+6. latency 统一表述为 model-forward microbenchmark，注明 GPU/dtype/batch/warmup；
+7. 测试数口径统一：三方曾报 76/74/73。建议统一跑 `pytest`
+   （`testpaths = ["src","scripts","packages"]`）并引用该数字。当前 slow/fast 相关子集为 73 passed。
+
+### 产物索引
+
+- checkpoints：`fast_residual_twohead_rebased`（主）、`fast_residual_force_only`、
+  `seed_{twohead,force_only}_s{1,2}`
+- 扫描 JSON：`artifacts/button_fast_evaluation/latency_sweep{,_force_only}.json`、`sweep_*_s{1,2}.json`
+  （**论文实验表格的唯一数据来源，未入 git，建议单独备份**）
+- 测试：`scripts/oracle_composition_test.py`
+- 脚本：`scripts/sweep_fast_latency.py`、`scripts/benchmark_fast_path_latency.py`
+- 提交：`b51bb30`（本文档）、`b9cd008`（两头实现 + 测试修复）、`ef2a119`（评估工具）
+- 论文：`ICRA2027Submission` 的 `23814c4`，方法章已按当前代码重写
+
+---
+
+# 归档：分轮讨论记录
+
+> 以下为按时间顺序的原始往复，**结论以上面的「当前有效结论」为准**。保留原文以便追溯论证过程。
+
 ## 总体结论
 
 两头 Fast Student 的拆分在工程上是自洽的：
@@ -152,7 +268,7 @@ token 类型槽位（回到 5）、前向分支、训练/评估/部署的串联�
 
 ### 二、不同意：解析 rebase（必须处理 #1）
 
-**结论：不建议实施，它会让指令空间误差变差约 18%。**
+**结论：不建议优先实施。线性 probe 下不占优；未经训练证伪——见顶部「措辞红线」。**
 
 先确认坐标关系与审查一致。设 `gap = (sigma_state/sigma_action)(S_t - S_k)`，
 `drift = A_null_delta - A_ref_delta`，则现方案的头学 `drift + gap`，审查建议的方案是把 `gap` 解析地
@@ -179,7 +295,7 @@ rebase 会把基线换成会重复计入已走位移的那个，再要求头把�
 **一处自我更正。** 我早前用一个**包含 gap 特征**的探针做过对比，得到"线性公式比网络好 4.6 倍"。
 那个特征集使两个目标只相差一个特征的线性函数，残差必然相同（都是 0.020505），对比是退化的，结论
 不成立。按上表的公平口径：陈旧头实测 val 增益 5.5%，其可见输入的线性上限是 6.95%，**头已经接近线性
-天花板**，不是简单的过拟合。真正的现象是：把 `S_k` 加进特征后线性上限升到 15.8%，但装了 anchor token
+probe baseline**（这只是线性可读性，不是信息上限——见顶部「措辞红线」）。真正的现象是：把 `S_k` 加进特征后线性上限升到 15.8%，但装了 anchor token
 的网络反而掉到 3.4%——信息确实有价值，网络没能利用且过拟合了。所以审查关于 `S_k` 信息重要的直觉是
 部分成立的，但兑现它需要解决泛化，而不是换目标分解。
 
