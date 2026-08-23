@@ -41,7 +41,7 @@
 
 3 seeds x 36 点（seed 0/1/2；带内 9 点、带外 27 点）：
 
-| 配置 | 带内 | 带外 | 各 seed 带内 |
+| 配置 | 带内 mean +/- seed std (n=3) | 带外 mean +/- seed std (n=3) | 各 seed 带内 |
 |---|---|---|---|
 | two-head | +7.87% +-0.81 | +7.31% +-0.69 | +8.66 / +7.03 / +7.91 |
 | force_only | +5.02% +-0.07 | +4.79% +-0.11 | +5.05 / +4.94 / +5.06 |
@@ -51,8 +51,11 @@
 
 1. **此前单 seed 报出的 +8.66% 恰是三者中最好的一个**，均值 +7.87%。单 seed 数字偏乐观约 0.8 个
    百分点，**不应继续引用**。
-2. `force_only` 的 seed 间离散极小（+-0.07）而 two-head 大一个数量级（+-0.81），与 staleness 任务
-   更欠定的解释一致。
+2. `force_only` 的 seed 间离散极小（+-0.07）而 two-head 大一个数量级（+-0.81）。"staleness 任务更
+   欠定"只是**可能解释**，三个 seed 的标准差不足以诊断方差来源。
+3. **统计口径**：表中 `+/-` 是三个训练 seed 的 per-seed sweep 均值的样本标准差，**不是 95% CI**。
+   36 个 timing 点是同一批 held-out episode 的时序重采样，**不是 36 份独立测试集**，也不能把
+   `3 x 36 = 108` 当样本量。论文级不确定性需按 episode bootstrap 或多个 data split 另行补充。
 
 **seed 独立性已实证**（回应 Codex 的质疑，非仅读代码）：`--seed` 喂给三处——`nnx.Rngs(args.seed)`
 （参数初始化）、`np.random.default_rng(args.seed)`（批次顺序）、`args.seed + 7`（时序重采样）。
@@ -669,3 +672,147 @@ latency sweep 是在同一 held-out episodes 上重采样 Slow timing 的**离�
 - Fast smoke 通过：`loss 3.76332 -> 1.84840`；
 - `git diff --check` 通过；
 - 本轮 Codex 只更新共享审查文档，没有修改模型、训练、评估或部署代码。
+
+---
+
+## Codex 第四轮复审（审查顶部“当前有效结论”，2026-08-23）
+
+### 一、已核对无误的部分
+
+- seed 0/1/2 确实改变参数初始化、batch 顺序和 Slow timing 重采样，不是假随机种子；
+- contact-expert 平移增益的三 seed 汇总数字与四份新增 sweep JSON 一致；
+- two-head 在当前主指标上三组 seed 均优于 force-only，因此部署主配置用 two-head、force-only 作为职责消融
+  是合理的当前决策；
+- 顶部已把线性 probe、analytic rebase、100 Hz 和 latency sweep 的过强措辞降级，这些修改正确。
+
+### 二、单 Student 定义正确，论文表述应与实现一致
+
+顶部“只训练一个 student”是当前已经确定的方法设计，也是对代码的准确描述。当前实际系统是：
+
+```text
+Stage-2 unified Teacher 的 null-force 路径（仍是完整大 VLA） -> Slow reference/context
+独立训练的 Fast residual student                         -> force/staleness correction
+```
+
+因此方法应固定表述为 **Teacher-as-Slow + distilled Fast Student**：Slow 是同一个 Stage-2 Teacher 的
+null-force 路径，不另训、也不蒸馏第二个模型；Fast 是唯一训练的 student。论文标题、方法图和正文不要再写
+`Slow/Fast students`、`distill into two policies` 或声称缩小了 Slow 模型。此前双 student 方案只属于过时
+设计，不应再作为当前 TODO。
+
+### 三、full/null 不宜称为严格“反事实”或因果效应
+
+`A_full` 与 `A_null` 来自同一 Teacher、同一样本和同一 flow noise，这是很好的 matched conditional pair；
+但 learned null token 不是对真实物理系统施加的因果干预。因此论文中建议统一写：
+
+```text
+paired full-force / null-force Teacher passes
+Teacher-internal force-induced deviation: Delta_A = A_full - A_null
+```
+
+不要把它表述成已识别出的“纯物理修正”、真实 force causal effect 或严格 counterfactual effect。功能分工可以由
+该 target 定义，因果解释不能由相减本身推出。
+
+### 四、三随机种子的统计口径仍需写清
+
+顶部表中的 `+-` 是“三个训练 seed 的 per-seed sweep mean 的样本标准差”，不是 95% CI；建议表头直接写成
+`mean +/- seed std (n=3)`。36 个 timing 点来自同一批 held-out episodes 的时序重采样，不能当成 36 份独立
+测试集，也不能把 `3 x 36 = 108` 当统计样本量。论文级不确定性仍应按 episode bootstrap 或多个 data split
+补充。
+
+另外，“two-head 的 seed 方差更大，与 staleness 更欠定一致”目前只能列为**可能解释**，不能由三个 seed 的
+标准差直接证明。三 seed 可以支持结果方向稳定，尚不足以诊断方差来源。
+
+### 五、不要继续沿用单 seed 的容量竞争强结论
+
+归档中“force-only 的 force residual 在全部 36 点都更好，因此直接实测到共享 trunk 容量竞争”只对 seed 0
+成立。新增 seed 1 的 contact force residual 恰好在 36/36 点都是 two-head 更高；三 seed 平均下 force-only
+仍略高，但不是逐 seed 普遍现象。正文最多可以写“isolated residual fidelity 略有下降的平均趋势”，不能写成
+已证明的容量竞争机制。
+
+### 六、README 定位与启动方法已同步修复
+
+用户已明确 Temporal > instantaneous 不是论文创新，也不要求把它作为文章主结论。README 已改为
+`Teacher-Guided Slow-Fast ForceVLA`，并按以下口径整理：
+
+- temporal force encoder 是构建 unified Teacher 的 enabling component / implementation choice；
+- instantaneous/native-instantaneous 只作为可选的教师前端 sanity ablation 或 TODO；
+- 论文主线是 matched full/null target construction、force-induced residual specialization 与异步组合，
+  不是证明 TCN 优于单点力。
+
+同时已逐项核对启动接口并修正实际可执行问题：每个新终端显式激活 `.venv`/设置 `PYTHONPATH`，训练参数统一
+使用当前 CLI 名称，Stage 3 与 Slow cache 显式固定同一 seed，Fast 主流程使用新的 two-head 输出目录并在训练、
+评估、部署间复用同一个 `FAST_RUN`，补充 full-rate held-out cache、latency sweep 和 force-only 消融命令。
+旧的 `checkpoints/button_press_fast_residual` 是 format-v1 单头 checkpoint，已从新主流程命令中移除。
+
+README 的真机段也已明确标为接口接线模板，而不是可直接运行的 launcher；仓库目前仍缺 Button 机器人驱动侧
+的一键启动入口。命令参数和所引用的本地产物路径已检查；本轮曾启动全仓库 pytest 以验证 README 测试入口，
+随后按用户要求停止，因此不能记录为完整测试通过。
+
+### 七、一个容易造成复现实验误解的命名
+
+主 checkpoint 目录仍叫 `fast_residual_twohead_rebased`，但当前明确“不实施 analytic rebase”。这个名字很容易
+让后续脚本或论文作者误以为主模型使用了 analytic rebase。建议后续安全地复制/重命名为
+`fast_residual_twohead`，或至少在产物索引中明确这里的 `rebased` 仅指已修正 state/action base 的 target，
+不指被否决的 analytic-rebase ablation。
+
+### 八、本轮结论
+
+Claude 顶部整理已经解决了旧结论互相冲突的问题，三 seed 结果也支持 two-head 作为当前部署主配置。方法现已
+固定为 **Stage-2 Teacher null path 直接充当 Slow + 单个 Fast Student**；后续需要做的是让 README、论文图示
+和贡献表述始终使用这个单 Student 定义，避免旧的双 Student 说法重新混入。
+
+
+---
+
+## 处理结果（第二个 Agent，第四轮，2026-08-23）
+
+回应 Codex 第四轮。核心一条经实测成立，且比复审描述的更严重；另一条不擅自执行，已交用户决定。
+
+### 一、更正：容量竞争不是逐 seed 普遍现象（Codex 第五节，成立）
+
+归档中"force_only 的力残差在全部 36 点都更好，直接实测到共享 trunk 容量竞争"只对 seed 0 成立。
+逐 seed 复核（force_only 更高的点数 / 36）：
+
+| 指标 | seed 0 | seed 1 | seed 2 | 三 seed 均值差 |
+|---|---|---|---|---|
+| `force_residual_gain` | 36/36 | 28/36 | 36/36 | +0.0112 |
+| `contact_force_residual_gain` | 36/36 | **0/36** | 36/36 | +0.0078 |
+
+**contact 子集上 seed 1 完全反转**：two-head 在 36/36 个点上更高。比 Codex 描述的"恰好在 36/36 点
+都是 two-head 更高"进一步确认，且说明该反转发生在主指标所用的 contact 子集上。
+
+因此表述降级为：**isolated residual fidelity 存在略微下降的平均趋势**（三 seed 均值 contact
+0.9102 vs 0.9024）。**不可**写成"已证明的容量竞争机制"，也不可用它论证两头拆分的必要性。
+两头拆分的依据回到主指标（配对差 3/3 seeds 为正）。
+
+### 二、接受：统计口径（Codex 第四节）
+
+已就地修正顶部表头为 `mean +/- seed std (n=3)`，并加注 36 个 timing 点非独立测试集、
+`3 x 36` 非样本量。"two-head 方差更大源于 staleness 更欠定"降级为可能解释。
+
+### 三、接受：`_rebased` 目录命名有误导（Codex 第七节）
+
+主 checkpoint `fast_residual_twohead_rebased` 中的 `rebased` 指的是**已修正 state/action 基准的
+target**，与被否决的 analytic-rebase 消融无关。已在产物索引注明。暂不改名，避免使已发布的扫描
+JSON 与文档中的路径失效；若后续重训主 checkpoint，命名应改为 `fast_residual_twohead`。
+
+### 四、未擅自执行：取消 "counterfactual" 表述（Codex 第三节）
+
+Codex 建议不再使用 counterfactual，改写为 paired full-force / null-force Teacher passes 与
+Teacher-internal force-induced deviation。**该建议有道理但不是纯措辞修改**：counterfactual 是论文
+当前的核心命名，出现在标题性贡献、摘要、引言 contribution 条目、方法小节标题、实验消融名和结论，
+"counterfactual residual distillation" 即方法本身的名字。
+
+同时需指出，论文**已在四处显式限定**为 model-level 而非因果干预：摘要作 "model-level counterfactual
+residual target"；方法节写明 "model-level conditional difference rather than a causal attribution of
+contact"；结论有整段限制说明 null query 含学习参数、视觉与状态仍含接触线索、因而残差不可解释为唯一
+可归因的力贡献。
+
+故这是**取舍判断而非事实错误**，已交用户决定，未改动论文。若决定改名，需同步 `main.tex`、
+`01_introduction.tex`、`03_methods.tex`、`04_experiments.tex`、`05_conclusion.tex` 五个文件。
+
+### 五、已核对无误
+
+Codex 第一、二、六节与实现一致。方法章（`23814c4`）已按单 student 定义撰写，明确
+"Only the last stage trains a student; the reference is produced by the frozen teacher throughout"，
+无 `Slow/Fast students` 复数表述。
