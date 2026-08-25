@@ -81,9 +81,19 @@ def benchmark_fast_student(args) -> tuple[float, np.ndarray]:
     model = slow_fast.FastStudentWithIntentProjector(
         config,
         slow_context_dim=args.slow_context_dim,
-        num_intent_tokens=args.context_tokens,
+        num_intent_tokens=args.intent_tokens,
         rngs=nnx.Rngs(0),
     )
+    # Both prediction heads intentionally start at zero for safe training. Leaving
+    # them at zero lets XLA prune most of the randomly initialized model, producing
+    # a dispatch benchmark rather than the trained model's compute cost.
+    model.fast_student.residual_head.kernel.value = jax.random.normal(
+        jax.random.key(1), model.fast_student.residual_head.kernel.value.shape
+    )
+    if model.fast_student.staleness_head is not None:
+        model.fast_student.staleness_head.kernel.value = jax.random.normal(
+            jax.random.key(2), model.fast_student.staleness_head.kernel.value.shape
+        )
     inputs = (
         jnp.zeros((1, args.context_tokens, args.slow_context_dim), jnp.float32),
         jnp.ones((1, args.context_tokens), bool),
@@ -122,6 +132,7 @@ def main() -> None:
     parser.add_argument("--action-expert-variant", default="gemma_300m")
     parser.add_argument("--chunk-steps", type=int, default=5)
     parser.add_argument("--context-tokens", type=int, default=16)
+    parser.add_argument("--intent-tokens", type=int, default=2)
     parser.add_argument("--slow-context-dim", type=int, default=2048)
     parser.add_argument("--force-window", type=int, default=10)
     parser.add_argument("--action-dims", type=int, default=10)
