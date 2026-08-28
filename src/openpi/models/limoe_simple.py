@@ -520,6 +520,19 @@ class MoeLayer(nn.Module):
         inputs_dtype = inputs.dtype
         inputs = jax.lax.convert_element_type(inputs, self.dtype)
 
+        # The all-to-all packing below reshapes the routing-group axis across
+        # experts and therefore used to require ``num_groups % num_experts == 0``.
+        # That assumption is not guaranteed by the token layout: for example a
+        # batch-one ForceVLA prefix has 817 groups for four experts.  Pad only the
+        # already-routed group axis, run the unchanged expert computation, and
+        # remove the temporary groups afterwards.  Padding the input token sequence
+        # instead would let fake tokens compete with real tokens for router capacity.
+        original_num_groups = num_groups
+        group_padding = (-num_groups) % num_experts
+        if group_padding:
+            inputs = jnp.pad(inputs, ((0, group_padding), (0, 0), (0, 0), (0, 0)))
+            num_groups += group_padding
+
         # Send examples to their target devices.
         inputs = flax_partitioning.with_sharding_constraint(
             inputs, ('expert', 'unmodeled', 'length', 'embed'))
@@ -582,6 +595,10 @@ class MoeLayer(nn.Module):
         outputs = outputs.reshape(num_groups, num_experts, capacity, hidden_dim)
         outputs = flax_partitioning.with_sharding_constraint(
             outputs, ('expert', 'unmodeled', 'length', 'embed'))
+
+        # Padded groups never participate in routing or recombination.  Strip them
+        # before returning so callers still see exactly one output per real group.
+        outputs = outputs[:original_num_groups]
 
         return jax.lax.convert_element_type(outputs, inputs_dtype)
 

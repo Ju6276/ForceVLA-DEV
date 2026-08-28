@@ -21,7 +21,13 @@ def test_selected_fast_defaults_use_10d_state_and_100hz_force():
     assert config.force_encoder.max_history_samples == 10
 
 
-def _config(*, predict_gate: bool = False, predict_staleness: bool = True, force_blind_staleness: bool = True):
+def _config(
+    *,
+    predict_gate: bool = False,
+    predict_staleness: bool = True,
+    force_blind_staleness: bool = True,
+    decoder_type: str = "set_transformer",
+):
     return slow_fast.FastResidualConfig(
         reference_dim=7,
         state_dim=8,
@@ -32,6 +38,7 @@ def _config(*, predict_gate: bool = False, predict_staleness: bool = True, force
         num_heads=2,
         num_kv_heads=1,
         head_dim=16,
+        decoder_type=decoder_type,
         predict_gate=predict_gate,
         predict_staleness=predict_staleness,
         force_blind_staleness=force_blind_staleness,
@@ -62,6 +69,47 @@ def test_fast_residual_student_shapes_and_zero_safe_initialization():
     np.testing.assert_array_equal(residual, 0)
     np.testing.assert_array_equal(staleness, 0)
     np.testing.assert_array_equal(gate, 1)
+
+
+def test_flash_gemma_student_uses_per_step_queries_and_preserves_interface():
+    config = _config(decoder_type="flash_gemma")
+    model = slow_fast.FastForceResidualStudent(config, rngs=nnx.Rngs(0))
+    residual, staleness, gate = model(
+        jnp.ones((2, 4, 6)),
+        jnp.ones((2, 4), dtype=jnp.bool_),
+        jnp.ones((2, 2, 16)),
+        jnp.ones((2, 8)),
+        jnp.ones((2, 7)),
+        jnp.zeros((2, 2)),
+    )
+
+    assert model.residual_query is None
+    assert model.residual_queries.value.shape == (config.chunk_steps, config.width)
+    assert residual.shape == (2, config.chunk_steps, config.pose_dims)
+    assert staleness.shape == residual.shape
+    np.testing.assert_array_equal(residual, 0)
+    np.testing.assert_array_equal(staleness, 0)
+    np.testing.assert_array_equal(gate, 1)
+
+
+def test_flash_gemma_staleness_pass_is_structurally_force_blind():
+    config = _config(decoder_type="flash_gemma")
+    model = slow_fast.FastForceResidualStudent(config, rngs=nnx.Rngs(7))
+    for head, seed in ((model.residual_head, 11), (model.staleness_head, 12)):
+        head.kernel.value = jax.random.normal(jax.random.key(seed), head.kernel.value.shape)
+
+    conditions = (
+        jnp.ones((2, 2, 16)),
+        jnp.ones((2, 8)),
+        jnp.ones((2, 7)),
+        jnp.zeros((2, 2)),
+    )
+    mask = jnp.ones((2, 4), dtype=jnp.bool_)
+    quiet_residual, quiet_staleness, _ = model(jnp.zeros((2, 4, 6)), mask, *conditions)
+    loud_residual, loud_staleness, _ = model(jnp.ones((2, 4, 6)) * 5.0, mask, *conditions)
+
+    np.testing.assert_array_equal(quiet_staleness, loud_staleness)
+    assert not np.allclose(quiet_residual, loud_residual)
 
 
 def test_staleness_head_cannot_see_force_while_the_residual_head_can():
@@ -133,12 +181,8 @@ def test_decoder_lets_conditions_see_each_other_but_hides_the_query():
 
     baseline = layer(tokens, valid, context_length=context_length)
     # Perturbing the trailing query must not leak into any condition's output.
-    perturbed = layer(
-        tokens.at[:, context_length:].add(10.0), valid, context_length=context_length
-    )
-    np.testing.assert_allclose(
-        baseline[:, :context_length], perturbed[:, :context_length], atol=1e-5
-    )
+    perturbed = layer(tokens.at[:, context_length:].add(10.0), valid, context_length=context_length)
+    np.testing.assert_allclose(baseline[:, :context_length], perturbed[:, :context_length], atol=1e-5)
     # A condition must react to the other conditions, which a causal mask forbade.
     shifted = layer(tokens.at[:, -2].add(10.0), valid, context_length=context_length)
     assert not np.allclose(baseline[:, 0], shifted[:, 0], atol=1e-5)
@@ -200,7 +244,7 @@ def test_fast_student_single_step_loss_has_output_head_gradients():
             jnp.ones((2, 8)),
             jnp.ones((2, 7)),
             jnp.zeros((2, 2)),
-            )
+        )
         return jnp.mean(jnp.square(residual - 1)) + jnp.mean(jnp.square(staleness - 1))
 
     loss, gradients = nnx.value_and_grad(loss_fn)(model)

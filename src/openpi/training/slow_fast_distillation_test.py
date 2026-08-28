@@ -111,6 +111,28 @@ def test_staleness_prediction_and_target_must_be_supplied_together():
         )
 
 
+def test_single_head_total_target_is_exact_sum_of_two_head_targets():
+    force = jnp.full((2, 3, 9), 0.25)
+    stale = jnp.full((2, 3, 9), -0.10)
+    targets = slow_fast_distillation.FastChunkTargets(
+        full_action=jnp.zeros((2, 3, 9)),
+        nominal_action=jnp.zeros((2, 3, 10)),
+        residual_pose=force,
+        staleness_pose=stale,
+    )
+    np.testing.assert_allclose(slow_fast_distillation.single_head_total_target(targets), 0.15, atol=1e-7)
+
+
+def test_single_head_total_target_requires_staleness_supervision():
+    targets = slow_fast_distillation.FastChunkTargets(
+        full_action=jnp.zeros((1, 2, 9)),
+        nominal_action=jnp.zeros((1, 2, 10)),
+        residual_pose=jnp.zeros((1, 2, 9)),
+    )
+    with pytest.raises(ValueError, match="requires a staleness target"):
+        slow_fast_distillation.single_head_total_target(targets)
+
+
 def test_paired_targets_require_matching_shapes():
     with pytest.raises(ValueError, match="matched"):
         slow_fast_distillation.make_paired_teacher_targets(jnp.zeros((1, 2, 7)), jnp.zeros((1, 3, 7)))

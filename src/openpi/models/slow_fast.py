@@ -14,12 +14,15 @@ latency and run at a rate that is not fixed at training time.
 from __future__ import annotations
 
 import dataclasses
+from typing import Literal
 
 import flax.nnx as nnx
+import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
 
 import openpi.models.force_encoder as _force_encoder
+import openpi.models.gemma as _gemma
 
 # The Fast time token is [context age / DEFAULT_CONTEXT_AGE_SCALE_S, interpolation alpha].
 # Offline cache extraction and the online runtime must divide by the same number, otherwise
@@ -55,6 +58,12 @@ class FastResidualConfig:
     num_kv_heads: int = 1
     head_dim: int = 256
     dropout_rate: float = 0.0
+    # `set_transformer` is the original lightweight block. `flash_gemma`
+    # replaces it with the repository's real Gemma block (RMSNorm, RoPE, GQA,
+    # gated MLP) and uses one learned query per emitted action step, matching the
+    # draft-head structure in Realtime-VLA FLASH while retaining our force/state/
+    # reference/time conditions and two residual targets.
+    decoder_type: Literal["set_transformer", "flash_gemma"] = "set_transformer"
     predict_gate: bool = False
     # Predict the stale-reference correction in a second head. The two quantities the
     # deployed action needs are `A_full - A_null` (what force changes) and
@@ -107,6 +116,8 @@ class FastResidualConfig:
             raise ValueError("num_heads must be divisible by num_kv_heads")
         if not 0 <= self.dropout_rate < 1:
             raise ValueError("dropout_rate must be in [0, 1)")
+        if self.decoder_type not in ("set_transformer", "flash_gemma"):
+            raise ValueError(f"Unknown fast decoder type: {self.decoder_type}")
         if self.force_encoder.type != "tcn":
             raise ValueError("Fast residual student requires a causal TCN force encoder")
         if self.force_encoder.hidden_dims[-1] != self.width:
@@ -236,6 +247,64 @@ class GemmaStyleDecoderLayer(nnx.Module):
         return tokens + self.dropout(mlp, deterministic=not train)
 
 
+class FlashGemmaDecoderBlock(nnx.Module):
+    """One native JAX Gemma block with FLASH-style positions and query access.
+
+    Realtime-VLA FLASH uses one HuggingFace ``GemmaDecoderLayer`` rather than a
+    full Gemma language model. This JAX counterpart reuses OpenPI's own Gemma
+    block, so it has the same RMSNorm convention, RoPE, grouped-query attention,
+    and gated MLP as the ForceVLA backbone without introducing a PyTorch island
+    into the JAX training loop.
+    """
+
+    def __init__(self, config: FastResidualConfig, *, rngs: nnx.Rngs):
+        gemma_config = _gemma.Config(
+            width=config.width,
+            depth=1,
+            mlp_dim=config.mlp_dim,
+            num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
+            head_dim=config.head_dim,
+        )
+        self.block = nnx_bridge.ToNNX(_gemma.Block(configs=[gemma_config], dropout=config.dropout_rate))
+        # Parameters do not depend on sequence length; a one-token example is
+        # enough to initialize the Linen block behind the NNX bridge.
+        self.block.lazy_init(
+            [jnp.zeros((1, 1, config.width), dtype=jnp.float32)],
+            None,
+            jnp.zeros((1, 1), dtype=jnp.int32),
+            jnp.ones((1, 1, 1, 1), dtype=jnp.bool_),
+            decode=False,
+            deterministic=True,
+            rngs=rngs,
+        )
+
+    def __call__(self, tokens, valid_mask, *, context_length: int, train: bool = False):
+        if tokens.ndim != 3 or valid_mask.shape != tokens.shape[:-1]:
+            raise ValueError(f"Expected tokens [B,S,D] and mask [B,S], got {tokens.shape} and {valid_mask.shape}")
+        if not 0 < context_length < tokens.shape[1]:
+            raise ValueError("context_length must leave at least one trailing action query")
+
+        batch_size, sequence_length, _ = tokens.shape
+        positions = jnp.broadcast_to(jnp.arange(sequence_length, dtype=jnp.int32), (batch_size, sequence_length))
+        token_positions = jnp.arange(sequence_length)
+        is_context = token_positions < context_length
+        # Prefix/context tokens attend bidirectionally within the valid prefix.
+        # Every action query can attend the full prefix and every action query,
+        # which matches Realtime-VLA FLASH's draft attention layout.
+        structural = is_context[None, :] | (~is_context[:, None])
+        mask = structural[None, :, :] & valid_mask[:, :, None] & valid_mask[:, None, :]
+        output, _ = self.block(
+            [tokens],
+            None,
+            positions,
+            mask[:, None, :, :],
+            decode=False,
+            deterministic=not train,
+        )
+        return output[0]
+
+
 class FastForceResidualStudent(nnx.Module):
     """One-block expert that predicts a short chunk of pose corrections.
 
@@ -264,11 +333,28 @@ class FastForceResidualStudent(nnx.Module):
         self.token_types = nnx.Param(
             nnx.initializers.normal(stddev=0.02)(rngs.params(), (5, config.width), jnp.float32)
         )
-        self.residual_query = nnx.Param(
-            nnx.initializers.normal(stddev=0.02)(rngs.params(), (config.width,), jnp.float32)
+        self.residual_query = (
+            nnx.Param(nnx.initializers.normal(stddev=0.02)(rngs.params(), (config.width,), jnp.float32))
+            if config.decoder_type == "set_transformer"
+            else None
         )
-        self.decoder = GemmaStyleDecoderLayer(config, rngs=rngs)
-        output_dim = config.pose_dims * config.chunk_steps + int(config.predict_gate)
+        self.residual_queries = (
+            nnx.Param(
+                nnx.initializers.normal(stddev=0.02)(rngs.params(), (config.chunk_steps, config.width), jnp.float32)
+            )
+            if config.decoder_type == "flash_gemma"
+            else None
+        )
+        self.decoder = (
+            FlashGemmaDecoderBlock(config, rngs=rngs)
+            if config.decoder_type == "flash_gemma"
+            else GemmaStyleDecoderLayer(config, rngs=rngs)
+        )
+        output_dim = (
+            config.pose_dims + int(config.predict_gate)
+            if config.decoder_type == "flash_gemma"
+            else config.pose_dims * config.chunk_steps + int(config.predict_gate)
+        )
         self.residual_head = nnx.Linear(
             config.width,
             output_dim,
@@ -280,7 +366,7 @@ class FastForceResidualStudent(nnx.Module):
         self.staleness_head = (
             nnx.Linear(
                 config.width,
-                config.pose_dims * config.chunk_steps,
+                config.pose_dims if config.decoder_type == "flash_gemma" else config.pose_dims * config.chunk_steps,
                 kernel_init=nnx.initializers.zeros_init(),
                 rngs=rngs,
             )
@@ -337,14 +423,22 @@ class FastForceResidualStudent(nnx.Module):
             ],
             axis=1,
         )
-        query = jnp.broadcast_to(self.residual_query.value[None, None, :], (b, 1, config.width))
+        if config.decoder_type == "flash_gemma":
+            query = jnp.broadcast_to(self.residual_queries.value[None, :, :], (b, config.chunk_steps, config.width))
+        else:
+            query = jnp.broadcast_to(self.residual_query.value[None, None, :], (b, 1, config.width))
         tokens = jnp.concatenate([context, query], axis=1)
-        valid_mask = jnp.concatenate([context_mask, jnp.ones((b, 1), dtype=jnp.bool_)], axis=1)
+        valid_mask = jnp.concatenate([context_mask, jnp.ones(query.shape[:2], dtype=jnp.bool_)], axis=1)
         hidden = self.decoder(tokens, valid_mask, context_length=context.shape[1], train=train)
-        output = self.residual_head(hidden[:, -1]).astype(jnp.float32)
-        span = config.pose_dims * config.chunk_steps
-        residual = output[..., :span].reshape(b, config.chunk_steps, config.pose_dims)
-        gate = jax.nn.sigmoid(output[..., span]) if config.predict_gate else jnp.ones((b,))
+        if config.decoder_type == "flash_gemma":
+            output = self.residual_head(hidden[:, -config.chunk_steps :]).astype(jnp.float32)
+            residual = output[..., : config.pose_dims]
+            gate = jax.nn.sigmoid(output[:, 0, config.pose_dims]) if config.predict_gate else jnp.ones((b,))
+        else:
+            output = self.residual_head(hidden[:, -1]).astype(jnp.float32)
+            span = config.pose_dims * config.chunk_steps
+            residual = output[..., :span].reshape(b, config.chunk_steps, config.pose_dims)
+            gate = jax.nn.sigmoid(output[..., span]) if config.predict_gate else jnp.ones((b,))
 
         staleness = None
         if self.staleness_head is not None:
@@ -358,9 +452,14 @@ class FastForceResidualStudent(nnx.Module):
                 readout = self.decoder(tokens, blind_mask, context_length=context.shape[1], train=train)
             else:
                 readout = hidden
-            staleness = (
-                self.staleness_head(readout[:, -1]).astype(jnp.float32).reshape(b, config.chunk_steps, config.pose_dims)
-            )
+            if config.decoder_type == "flash_gemma":
+                staleness = self.staleness_head(readout[:, -config.chunk_steps :]).astype(jnp.float32)
+            else:
+                staleness = (
+                    self.staleness_head(readout[:, -1])
+                    .astype(jnp.float32)
+                    .reshape(b, config.chunk_steps, config.pose_dims)
+                )
         return residual, staleness, gate
 
 

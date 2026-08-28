@@ -90,7 +90,9 @@ def main() -> None:
     if resampled.key_grid_timestamps is not None:
         arrays["key_grid_timestamps"] = resampled.key_grid_timestamps
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    tmp = args.output.with_suffix(args.output.suffix + ".tmp")
+    # Keep the temporary filename ending in ``.npz``.  Otherwise NumPy silently
+    # appends that suffix and ``replace`` looks for a path that was never written.
+    tmp = args.output.with_name(args.output.name + ".tmp.npz")
     np.savez_compressed(tmp, **arrays)
     tmp.replace(args.output)
 

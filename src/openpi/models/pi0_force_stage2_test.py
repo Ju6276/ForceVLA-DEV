@@ -163,6 +163,38 @@ def test_nominal_context_sampling_forwards_the_row_keyed_noise():
     np.testing.assert_array_equal(recorded["noise"], noise)
 
 
+def test_cached_context_sampling_uses_old_prefix_and_current_control_inputs(monkeypatch):
+    """Cached-context targets must not encode the unseen current image."""
+    context = SimpleNamespace(state=jnp.zeros((2, 13), dtype=jnp.float32), name="context-k")
+    control = SimpleNamespace(state=jnp.ones((2, 13), dtype=jnp.float32), name="control-t")
+    noise = jnp.zeros((2, 4, 3), dtype=jnp.float32)
+    calls = []
+
+    monkeypatch.setattr(pi0_force._model, "preprocess_observation", lambda _rng, obs, train: obs)
+
+    class Stub:
+        null_force_token = nnx.Param(jnp.zeros((4,), dtype=jnp.float32))
+
+        def _prepare_action_prefix(self, observation):
+            assert observation is context
+            return "tokens-k", "mask-k", "prefix-k", "cache-k"
+
+        def _sample_actions_with_prefix(self, rng, observation, **kwargs):
+            calls.append((observation, kwargs))
+            return kwargs["force_condition"]
+
+    full, null, prefix, mask = pi0_force.Pi0_Guidance.sample_paired_actions_from_cached_context(
+        Stub(), jax.random.key(0), context, control, num_steps=4, noise=noise
+    )
+
+    assert (full, null, prefix, mask) == ("full", "null", "prefix-k", "mask-k")
+    assert [call[0] for call in calls] == [control, control]
+    assert [call[1]["force_condition"] for call in calls] == ["full", "null"]
+    assert all(call[1]["prefix_out_fix"] == "prefix-k" for call in calls)
+    assert all(call[1]["kv_cache"] == "cache-k" for call in calls)
+    assert all(call[1]["noise"] is noise for call in calls)
+
+
 def test_standard_sampling_forwards_caller_supplied_noise():
     config = pi0_force.Pi0_GuidanceConfig()
     noise = jnp.arange(config.action_horizon * config.action_dim, dtype=jnp.float32).reshape(

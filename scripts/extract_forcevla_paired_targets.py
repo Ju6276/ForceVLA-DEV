@@ -23,9 +23,10 @@ from openpi.policies import rotation_6d as rot
 from openpi.shared import nnx_utils
 from openpi.training import config as config_lib
 from openpi.training import data_loader
+from openpi.training import fast_dataset
 from openpi.training import weight_loaders
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 def _atomic_write_json(path: pathlib.Path, value: dict) -> None:
@@ -125,6 +126,9 @@ def _write_manifest(
         "format_version": FORMAT_VERSION,
         "space": "ForceVLA normalized action space",
         "residual_definition": "normalized_full_actions[..., :9] - normalized_null_actions[..., :9]",
+        "target_context_mode": "cached_slow_packet" if args.context_cache is not None else "current_observation",
+        "context_cache": None if args.context_cache is None else str(args.context_cache.resolve()),
+        "flow_noise_key": "context_dataset_index" if args.context_cache is not None else "current_dataset_index",
         "config_name": args.config_name,
         "data_config_name": args.data_config_name or args.config_name,
         "checkpoint": str(args.checkpoint.resolve()),
@@ -166,6 +170,8 @@ def _validate_resume_manifest(output_dir: pathlib.Path, *, args, extraction_size
         "shard_size": args.shard_size,
         "num_flow_steps": args.num_steps,
         "seed": args.seed,
+        "target_context_mode": "cached_slow_packet" if args.context_cache is not None else "current_observation",
+        "context_cache": None if args.context_cache is None else str(args.context_cache.resolve()),
     }
     mismatches = {
         name: {"existing": existing.get(name), "requested": value}
@@ -282,6 +288,16 @@ def main() -> None:
     parser.add_argument("--num-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--context-cache",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Optional fixed Slow cache defining one active packet k for every current row t. "
+            "When set, Teacher full/null queries use V_k,L from that packet and current S_t/F_t. "
+            "Targets are then bound to this exact schedule and must not be trained with cache resampling."
+        ),
+    )
     args = parser.parse_args()
 
     if args.batch_size <= 0 or args.shard_size <= 0:
@@ -301,6 +317,24 @@ def main() -> None:
     extraction_size = dataset_size if args.max_samples is None else min(dataset_size, args.max_samples)
     if extraction_size <= 0:
         raise ValueError("Extraction set is empty")
+
+    context_cache = None
+    context_dataset_indices = None
+    context_row_ready = None
+    if args.context_cache is not None:
+        context_cache = fast_dataset.load_slow_cache(args.context_cache, expected_rows=dataset_size)
+        context_row_ready = (
+            np.ones(dataset_size, dtype=np.bool_)
+            if context_cache.row_ready is None
+            else np.asarray(context_cache.row_ready, dtype=np.bool_)
+        )
+        context_dataset_indices = np.arange(dataset_size, dtype=np.int64)
+        ready = np.flatnonzero(context_row_ready)
+        context_dataset_indices[ready] = context_cache.key_dataset_indices[
+            context_cache.row_key_positions[ready]
+        ]
+        if np.any(context_dataset_indices < 0) or np.any(context_dataset_indices >= dataset_size):
+            raise ValueError("Context cache refers to dataset rows outside the extraction dataset")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _validate_resume_manifest(args.output_dir, args=args, extraction_size=extraction_size)
@@ -333,7 +367,11 @@ def main() -> None:
         reference_state
     )
     model = config.model.load(params, remove_extra_params=False)
-    sample_paired = nnx_utils.module_jit(model.sample_paired_actions_and_context)
+    sample_paired = nnx_utils.module_jit(
+        model.sample_paired_actions_and_context
+        if context_cache is None
+        else model.sample_paired_actions_from_cached_context
+    )
     run_start = time.monotonic()
     processed_this_run = 0
 
@@ -347,15 +385,39 @@ def main() -> None:
             if valid_count < args.batch_size:
                 batch_indices = np.pad(batch_indices, (0, args.batch_size - valid_count), mode="edge")
             observation, batch_arrays = _load_batch(raw_dataset, transform, batch_indices)
+            context_observation = None
+            noise_indices = batch_indices
+            if context_dataset_indices is not None:
+                context_indices = context_dataset_indices[batch_indices]
+                context_observation, context_arrays = _load_batch(raw_dataset, transform, context_indices)
+                np.testing.assert_array_equal(
+                    context_arrays["episode_indices"], batch_arrays["episode_indices"]
+                )
+                batch_arrays["context_dataset_indices"] = context_indices
+                batch_arrays["context_timestamps"] = context_arrays["timestamps"]
+                batch_arrays["context_row_ready"] = context_row_ready[batch_indices]
+                # Tie all rows using one Slow packet to the same flow-noise draw.
+                # This removes sampling variation between A_ref,k and the cached-context
+                # query while full/null still share identical noise.
+                noise_indices = context_indices
             noise = model_lib.row_keyed_noise(
                 args.seed,
-                batch_indices,
+                noise_indices,
                 action_horizon=config.model.action_horizon,
                 action_dim=config.model.action_dim,
             )
-            full, null, _, _ = sample_paired(
-                jax.random.key(args.seed), observation, num_steps=args.num_steps, noise=noise
-            )
+            if context_observation is None:
+                full, null, _, _ = sample_paired(
+                    jax.random.key(args.seed), observation, num_steps=args.num_steps, noise=noise
+                )
+            else:
+                full, null, _, _ = sample_paired(
+                    jax.random.key(args.seed),
+                    context_observation,
+                    observation,
+                    num_steps=args.num_steps,
+                    noise=noise,
+                )
             full = np.asarray(full[:valid_count], dtype=np.float32)
             null = np.asarray(null[:valid_count], dtype=np.float32)
             batch_arrays.update(

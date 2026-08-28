@@ -321,6 +321,63 @@ head 布局和架构开关都从 run 目录的 `metadata.json` 读，不用手�
 
 ### 8. 可选消融与离线时序扫描
 
+`flash_gemma` 保持相同的 TCN、Slow cache、双头 targets 和训练超参数，只替换 Fast 的融合/读出模块：
+原始配置使用一个无位置编码的 Gemma-style set block 和单个展平 chunk query；该配置使用 OpenPI 原生
+Gemma block（Gemma RMSNorm、RoPE、GQA、gated MLP）以及每个 residual step 一个 learned query。这对齐
+Realtime-VLA FLASH 的 draft-head 结构原则，但不是其 speculative verification 系统，也不加载完整 18 层
+Gemma。为隔离架构变量，第一轮从零初始化，并写入独立目录：
+
+```bash
+FLASH_GEMMA_RUN=checkpoints/fast_residual_flash_gemma
+
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+python scripts/train_fast_residual.py \
+    --train-targets=artifacts/button_stage3_paired_targets/train \
+    --val-targets=artifacts/button_stage3_paired_targets/val \
+    --train-slow-cache=artifacts/button_slow_cache/train.npz \
+    --val-slow-cache=artifacts/button_slow_cache/val.npz \
+    --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
+    --output-dir=$FLASH_GEMMA_RUN \
+    --model-profile=flash_gemma \
+    --steps=10000 --batch-size=64 --chunk-steps=5 \
+    --timing-resample-interval=500 \
+    --slow-rate-hz 5 15 --slow-latency-ms 50 300 \
+    --staleness-weight=1.0 --seed=0 \
+    --wandb-project=forcevla --wandb-name=button_press_fast_flash_gemma
+```
+
+评估仍使用第 7 节的命令；loader 从 run 的 `metadata.json` 自动恢复 `decoder_type`，不要把
+`flash_gemma` checkpoint 强行装入原始 `selected` 结构。
+
+Teacher-initialized 消融保持上述架构与训练设置不变，只改变初始化。它复制生成 Stage 3 paired
+targets 的 ForceVLA Teacher 的 TCN stem/4 blocks，以及第 0 个 1024D Action Expert Gemma block；
+Teacher 的 LoRA 增量会先合并进稠密权重。Teacher 独有的 TCN `1024->2048` 投影不会复制，Fast
+独有的 intent/state/reference/time projections、per-step queries 和双输出 heads 仍按通常方式初始化：
+
+```bash
+TEACHER_INIT_RUN=checkpoints/fast_residual_flash_gemma_teacher_init
+TEACHER_CKPT=checkpoints/forcevla_button_temporal_stage2_null_bc/button_press_stage2_null_bc/9999
+
+WANDB_MODE=online XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
+python scripts/train_fast_residual.py \
+    --train-targets=artifacts/button_stage3_paired_targets/train \
+    --val-targets=artifacts/button_stage3_paired_targets/val \
+    --train-slow-cache=artifacts/button_slow_cache/train.npz \
+    --val-slow-cache=artifacts/button_slow_cache/val.npz \
+    --norm-stats-dir=assets/forcevla_button_temporal_100hz/panda_button_press_temporal_100hz_train56 \
+    --output-dir=$TEACHER_INIT_RUN \
+    --model-profile=flash_gemma_teacher_init \
+    --teacher-init-checkpoint=$TEACHER_CKPT --teacher-init-layer=0 \
+    --steps=10000 --batch-size=64 --chunk-steps=5 \
+    --timing-resample-interval=500 \
+    --slow-rate-hz 5 15 --slow-latency-ms 50 300 \
+    --staleness-weight=1.0 --seed=0 \
+    --wandb-project=forcevla --wandb-name=button_press_fast_flash_gemma_teacher_init
+```
+
+`metadata.json/teacher_initialization` 会记录来源、Teacher layer、复制数组数、合并 LoRA 数和实际复制
+参数量，避免把“请求了初始化”和“初始化确实发生了”混为一谈。
+
 `force_only` 使用同一训练入口，只关闭 staleness head；必须写到另一个空目录：
 
 ```bash
@@ -347,6 +404,7 @@ python scripts/train_fast_residual.py \
 |---|---|---|
 | `--force-sighted-staleness` | staleness head 改从共享前向读出，不再屏蔽 force token。decoder 只跑一遍，fast path 成本减半 | 已测，主配置不采用 |
 | `--analytic-rebase` | staleness 目标去掉基准修正项，头只学 drift，闭式项**仅在离线评估合成时**加回 | **offline ablation only**，见下 |
+| `--single-head-total-target` | 关闭第二个 head，让单个 head 直接学习 `delta_force + delta_stale`；必须保持 `--reconstruction-weight=0` | 已测，见第 10 节 |
 
 `--analytic-rebase` 训练出的 checkpoint **不可部署**：只有 `scripts/evaluate_fast_residual.py` 会把闭式项
 加回来以便同口径打分，`src/openpi/serving/` 里没有对应路径。新训练的 run 会把
@@ -461,10 +519,12 @@ Slow 观测那一行的 state `S_k` 的 delta，`A_null(t)` 是相对当前行 `
 漏掉它会让物理旋转误差相对单头基线倒退 74.85%——旋转坐标在这两行之间的变化量和参考漂移本身同量级。
 `S_k` 在部署时来自 Slow packet 的 `state_at_observation`，`to_absolute_command` 已经在用它还原绝对指令。
 
-单头训练这个和不可行：陈旧项的 MSE 约为力残差的十四倍，实测把 `--reconstruction-weight` 开到 0.5
-就足以让力残差保真度从 +91.8% 掉到 −18.6%（比输出零还差），同时输出幅度从 0.135 涨到 0.282，力归因的
-消融证据随之失效。这是单次运行的观察；「单个头把容量全花在大的那一项上」是对它的一种解释，未做多 seed
-复核，不应作为已证明的机制引用。
+单头直接训练这个和是可学习的，但当前 Button 单 seed 对照不如分头监督。`single_head_total` 的 5k 最佳已保存
+checkpoint 在 held-out 数据上的 step-0 总修正 MSE 为 0.02369（相对零修正改善 13.94%）；主双头 10k 为
+0.02230（改善 18.97%）。单头继续到 10k 后退化到 0.02605，说明它还更容易过拟合。此前
+`--reconstruction-weight=0.5` 的实验不是这个对照：它同时要求一个 head 拟合 force target 和总重建，确实会让
+力残差保真度从 +91.8% 掉到 −18.6%，但不能用来否定直接 sum-target。以上仍是单 seed 离线结果，不能写成
+普遍机制结论。
 
 陈旧项与力基本无关，因此 staleness head 走第二次 decoder 前向，**force token 在 attention mask 里被屏蔽**，
 力无关性由结构保证而不是靠损失函数自觉。评估脚本会在力消融下比较两次 staleness 输出，主配置下

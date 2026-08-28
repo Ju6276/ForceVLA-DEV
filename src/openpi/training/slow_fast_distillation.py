@@ -177,3 +177,21 @@ def fast_residual_loss(
         metrics["staleness_loss"] = staleness_loss
         metrics["staleness_loss_step0"] = jnp.mean(staleness_error[:, 0])
     return total, metrics
+
+
+def single_head_total_target(targets: FastChunkTargets) -> jnp.ndarray:
+    """Return the complete correction assigned to a one-head ablation.
+
+    This is deliberately different from the historical ``force_only`` single-head
+    model.  The latter predicts only ``residual_pose`` and leaves stale-reference
+    error unmodelled; this ablation directly predicts the sum that the two-head
+    student composes at execution time.
+    """
+    if targets.staleness_pose is None:
+        raise ValueError("single-head total supervision requires a staleness target")
+    if targets.staleness_pose.shape != targets.residual_pose.shape:
+        raise ValueError(
+            "Force and staleness targets must have identical shapes, got "
+            f"{targets.residual_pose.shape} and {targets.staleness_pose.shape}"
+        )
+    return targets.residual_pose + targets.staleness_pose

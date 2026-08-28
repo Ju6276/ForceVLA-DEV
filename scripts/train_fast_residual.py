@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gc
 import json
 import pathlib
 import time
@@ -17,7 +18,9 @@ import orbax.checkpoint as ocp
 import wandb
 
 from openpi.models import force_encoder
+from openpi.models import model as model_lib
 from openpi.models import slow_fast
+from openpi.models import slow_fast_teacher_init
 from openpi.shared import normalize as normalize_lib
 from openpi.training import fast_dataset
 from openpi.training import slow_fast_distillation
@@ -98,7 +101,7 @@ def _make_batch(arrays, cache, indices: np.ndarray, *, staleness_target=None) ->
     }
 
 
-def _loss(model, batch, loss_config, *, train: bool):
+def _loss(model, batch, loss_config, *, train: bool, single_head_total_target: bool = False):
     predicted, staleness, _, _ = model(
         batch["slow_context"],
         batch["slow_context_mask"],
@@ -110,13 +113,29 @@ def _loss(model, batch, loss_config, *, train: bool):
         train=train,
     )
     pose_dims = loss_config.pose_dims
-    staleness_target = batch["target_staleness"] if staleness is not None else None
+    staleness_target = batch["target_staleness"] if (staleness is not None or single_head_total_target) else None
     target = slow_fast_distillation.FastChunkTargets(
         full_action=batch["target_full_pose"],
         nominal_action=batch["reference_chunk"],
         residual_pose=batch["target_residual"],
         staleness_pose=staleness_target,
     )
+    if single_head_total_target:
+        if staleness is not None:
+            raise ValueError("single-head total-target mode must not instantiate a staleness head")
+        combined = slow_fast_distillation.single_head_total_target(target)
+        # Put the reconstruction diagnostic in the same rebased normalized frame as
+        # the summed target.  The optimization itself remains the direct one-head
+        # target loss below (reconstruction_weight is required to be zero).
+        reconstructed_target = batch["target_full_pose"].at[..., :pose_dims].set(
+            batch["reference_chunk"][..., :pose_dims] + combined
+        )
+        target = dataclasses.replace(
+            target,
+            full_action=reconstructed_target,
+            residual_pose=combined,
+            staleness_pose=None,
+        )
     total, parts = slow_fast_distillation.fast_residual_loss(
         predicted,
         batch["reference_chunk"],
@@ -125,7 +144,7 @@ def _loss(model, batch, loss_config, *, train: bool):
         predicted_staleness=staleness,
     )
     prediction_l2 = jnp.mean(jnp.linalg.norm(predicted, axis=-1))
-    target_l2 = jnp.mean(jnp.linalg.norm(batch["target_residual"], axis=-1))
+    target_l2 = jnp.mean(jnp.linalg.norm(target.residual_pose, axis=-1))
     # What the robot actually executes is A_ref + force + staleness. Its error against
     # the Teacher no longer splits into a trained and an untrained half: this is the
     # zero-correction baseline for the staleness head, not an error nobody owns.
@@ -158,6 +177,10 @@ def _parameter_count(model) -> int:
 def _model_config(profile: str, *, chunk_steps: int) -> slow_fast.FastResidualConfig:
     if profile == "selected":
         return slow_fast.FastResidualConfig(chunk_steps=chunk_steps)
+    if profile == "flash_gemma":
+        return slow_fast.FastResidualConfig(chunk_steps=chunk_steps, decoder_type="flash_gemma")
+    if profile == "flash_gemma_teacher_init":
+        return slow_fast.FastResidualConfig(chunk_steps=chunk_steps, decoder_type="flash_gemma")
     if profile == "smoke":
         return slow_fast.FastResidualConfig(
             chunk_steps=chunk_steps,
@@ -257,6 +280,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--single-head-total-target",
+        action="store_true",
+        help=(
+            "Ablation: use one output head and supervise it directly on "
+            "delta_force + delta_stale. Unlike --no-staleness-head, this does model "
+            "stale-reference correction, but it gives up the explicit force/staleness decomposition."
+        ),
+    )
+    parser.add_argument(
         "--chunk-steps",
         type=int,
         default=slow_fast.DEFAULT_FAST_CHUNK_STEPS,
@@ -301,7 +333,28 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", default="forcevla")
     parser.add_argument("--wandb-name", default="button_press_fast_residual")
-    parser.add_argument("--model-profile", choices=("selected", "smoke"), default="selected")
+    parser.add_argument(
+        "--model-profile",
+        choices=("selected", "flash_gemma", "flash_gemma_teacher_init", "smoke"),
+        default="selected",
+        help=(
+            "selected keeps the original one-query set block; flash_gemma uses one native "
+            "Gemma block with RoPE and one learned query per emitted residual step; "
+            "flash_gemma_teacher_init additionally transfers the Teacher TCN and one merged-LoRA Action Expert layer."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-init-checkpoint",
+        type=pathlib.Path,
+        default=None,
+        help="ForceVLA Teacher checkpoint root or params directory, required by flash_gemma_teacher_init.",
+    )
+    parser.add_argument(
+        "--teacher-init-layer",
+        type=int,
+        default=0,
+        help="Zero-based Action Expert Gemma layer copied into the one-block Fast decoder.",
+    )
     parser.add_argument(
         "--no-reference-token",
         action="store_true",
@@ -314,6 +367,14 @@ def main() -> None:
 
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Refusing to overwrite non-empty output directory: {args.output_dir}")
+    teacher_initialized = args.model_profile == "flash_gemma_teacher_init"
+    if teacher_initialized != (args.teacher_init_checkpoint is not None):
+        raise ValueError(
+            "flash_gemma_teacher_init requires --teacher-init-checkpoint, and that option must not be used "
+            "with another model profile"
+        )
+    if args.teacher_init_layer < 0:
+        raise ValueError("--teacher-init-layer must be non-negative")
     if min(args.steps, args.batch_size, args.peak_lr, args.end_lr, args.save_interval, args.eval_interval) <= 0:
         raise ValueError("Steps, batch size, learning rates, and intervals must be positive")
     if not 0 <= args.warmup_steps < args.steps:
@@ -331,21 +392,24 @@ def main() -> None:
     config = _model_config(args.model_profile, chunk_steps=args.chunk_steps)
     if args.no_reference_token:
         config = dataclasses.replace(config, use_reference_token=False)
-    if args.no_staleness_head:
+    if args.no_staleness_head or args.single_head_total_target:
         config = dataclasses.replace(config, predict_staleness=False)
     if args.force_sighted_staleness:
-        if args.no_staleness_head:
+        if args.no_staleness_head or args.single_head_total_target:
             raise ValueError("--force-sighted-staleness needs a staleness head to be sighted")
         config = dataclasses.replace(config, force_blind_staleness=False)
-    if args.analytic_rebase and args.no_staleness_head:
+    if args.analytic_rebase and (args.no_staleness_head or args.single_head_total_target):
         raise ValueError("--analytic-rebase only changes the staleness target, which needs a staleness head")
+    if args.single_head_total_target and args.reconstruction_weight != 0:
+        raise ValueError("--single-head-total-target requires --reconstruction-weight=0 for a clean direct-target ablation")
 
     state_to_action_scale = None
-    if config.predict_staleness:
+    needs_staleness_target = config.predict_staleness or args.single_head_total_target
+    if needs_staleness_target:
         if args.norm_stats_dir is None or not (args.norm_stats_dir / "norm_stats.json").is_file():
             raise ValueError(
-                "--norm-stats-dir must point at a directory containing norm_stats.json when the "
-                "staleness head is enabled, or pass --no-staleness-head. The target is a gap "
+                "--norm-stats-dir must point at a directory containing norm_stats.json when a "
+                "staleness target is used. The target is a gap "
                 "between two base states, and without the scales it cannot be put in action units."
             )
         norm_stats = normalize_lib.load(args.norm_stats_dir)
@@ -359,12 +423,31 @@ def main() -> None:
     val_arrays = fast_dataset.load_stage3_fast_arrays(args.val_targets, chunk_steps=config.chunk_steps)
     train_cache = fast_dataset.load_slow_cache(args.train_slow_cache, expected_rows=len(train_arrays.dataset_indices))
     val_cache = fast_dataset.load_slow_cache(args.val_slow_cache, expected_rows=len(val_arrays.dataset_indices))
-    for name, cache in (("train", train_cache), ("validation", val_cache)):
+    target_context_modes = {}
+    for name, target_dir, arrays, cache in (
+        ("train", args.train_targets, train_arrays, train_cache),
+        ("validation", args.val_targets, val_arrays, val_cache),
+    ):
         if cache.chunk_steps != config.chunk_steps:
             raise ValueError(
                 f"The {name} Slow cache holds {cache.chunk_steps}-step reference rollouts but the "
                 f"student emits {config.chunk_steps}; re-extract the cache with a matching --chunk-steps"
             )
+        context_indices = fast_dataset.load_cached_context_dataset_indices(target_dir)
+        target_context_modes[name] = "cached_slow_packet" if context_indices is not None else "current_observation"
+        if context_indices is not None:
+            ready = np.ones(len(context_indices), dtype=np.bool_) if cache.row_ready is None else cache.row_ready
+            expected_context = np.arange(len(context_indices), dtype=np.int64)
+            expected_context[ready] = cache.key_dataset_indices[cache.row_key_positions[ready]]
+            np.testing.assert_array_equal(context_indices, expected_context)
+    if len(set(target_context_modes.values())) != 1:
+        raise ValueError(f"Train and validation targets use different context modes: {target_context_modes}")
+    target_context_mode = target_context_modes["train"]
+    if target_context_mode == "cached_slow_packet" and args.timing_resample_interval:
+        raise ValueError(
+            "Cached-context Teacher targets are bound to their recorded Slow packets; "
+            "set --timing-resample-interval=0 instead of changing k without regenerating targets"
+        )
 
     slow_context_dim = int(train_cache.context_tokens.shape[-1])
     if val_cache.context_tokens.shape[-1] != slow_context_dim:
@@ -374,6 +457,30 @@ def main() -> None:
         slow_context_dim=slow_context_dim,
         rngs=nnx.Rngs(args.seed),
     )
+    teacher_init_report = None
+    teacher_init_params_path = None
+    if teacher_initialized:
+        source = args.teacher_init_checkpoint.resolve()
+        teacher_init_params_path = source / "params" if (source / "params").is_dir() else source
+        if not teacher_init_params_path.is_dir():
+            raise FileNotFoundError(f"Teacher params directory does not exist: {teacher_init_params_path}")
+        print(f"Restoring Teacher initialization from {teacher_init_params_path}", flush=True)
+        teacher_params = model_lib.restore_params(teacher_init_params_path, restore_type=np.ndarray)
+        teacher_init_report = slow_fast_teacher_init.initialize_fast_from_forcevla_teacher(
+            model,
+            teacher_params,
+            layer_index=args.teacher_init_layer,
+        )
+        del teacher_params
+        gc.collect()
+        print(
+            "Teacher initialization: "
+            f"TCN arrays={teacher_init_report.tcn_arrays}, "
+            f"Gemma arrays={teacher_init_report.gemma_arrays}, "
+            f"merged LoRA arrays={teacher_init_report.merged_lora_arrays}, "
+            f"parameters copied={teacher_init_report.copied_parameters:,}",
+            flush=True,
+        )
     loss_config = slow_fast_distillation.FastDistillationLossConfig(
         residual_weight=1.0,
         reconstruction_weight=args.reconstruction_weight,
@@ -399,7 +506,13 @@ def main() -> None:
     @nnx.jit
     def train_step(module, opt, batch):
         def loss_fn(m):
-            return _loss(m, batch, loss_config, train=True)
+            return _loss(
+                m,
+                batch,
+                loss_config,
+                train=True,
+                single_head_total_target=args.single_head_total_target,
+            )
 
         (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(module)
         grad_norm = optax.global_norm(grads)
@@ -408,7 +521,13 @@ def main() -> None:
 
     @nnx.jit
     def eval_step(module, batch):
-        return _loss(module, batch, loss_config, train=False)
+        return _loss(
+            module,
+            batch,
+            loss_config,
+            train=False,
+            single_head_total_target=args.single_head_total_target,
+        )
 
     parameter_count = _parameter_count(model)
     run = wandb.init(
@@ -425,7 +544,11 @@ def main() -> None:
         # 2 adds the staleness head, which deployment must add to the reference on top
         # of the force residual. A version-1 run must not be composed as if it had one.
         "format_version": 2,
-        "architecture": "100 Hz causal TCN + pooled Slow V-L context + one Gemma-style layer + 9D pose residual",
+        "architecture": (
+            "100 Hz causal TCN + pooled Slow V-L context + one native Gemma block + per-step residual queries"
+            if config.decoder_type == "flash_gemma"
+            else "100 Hz causal TCN + pooled Slow V-L context + one Gemma-style set layer + flattened residual query"
+        ),
         "fast_output": (
             f"{config.chunk_steps}-step normalized xyz+6D residual chunk spaced by the Teacher "
             "action period; gripper remains owned by Slow"
@@ -433,16 +556,30 @@ def main() -> None:
                 f"; a second {'force-blind' if config.force_blind_staleness else 'force-sighted'} head "
                 "emits the stale-reference correction and the executed action is their sum"
                 if config.predict_staleness
-                else "; single head, no stale-reference correction"
+                else (
+                    "; one head directly emits force plus stale-reference correction"
+                    if args.single_head_total_target
+                    else "; single head, no stale-reference correction"
+                )
             )
         ),
         "predict_staleness": config.predict_staleness,
+        "target_mode": "single_head_total" if args.single_head_total_target else "decomposed",
+        "teacher_target_context_mode": target_context_mode,
         # Evaluation must add the base-state gap back in closed form for a run trained
         # this way, so the flag has to travel with the checkpoint. The serving runtime
         # has no such path, which is why these runs are offline ablations only.
         "analytic_rebase": bool(args.analytic_rebase),
         "analytic_rebase_is_offline_ablation_only": bool(args.analytic_rebase),
         "parameter_count": parameter_count,
+        "teacher_initialization": (
+            None
+            if teacher_init_report is None
+            else {
+                "source": str(teacher_init_params_path),
+                **dataclasses.asdict(teacher_init_report),
+            }
+        ),
         "config": {**vars(config), "force_encoder": vars(config.force_encoder)},
         "loss": vars(loss_config),
         # The band actually trained on. It is not recoverable from the train cache:
@@ -492,6 +629,7 @@ def main() -> None:
         size=min(args.eval_samples, len(val_pool)),
         replace=False,
     )
+
     def _staleness(arrays, cache, indices):
         if state_to_action_scale is None:
             return None
@@ -514,9 +652,7 @@ def main() -> None:
                 {
                     "timing/ready_row_fraction": float(np.mean(train_cache.row_ready)),
                     "timing/mean_normalized_age": float(np.mean(train_cache.time_features[train_pool, 0])),
-                    "timing/saturated_age_fraction": float(
-                        np.mean(train_cache.time_features[train_pool, 0] >= 1.0)
-                    ),
+                    "timing/saturated_age_fraction": float(np.mean(train_cache.time_features[train_pool, 0] >= 1.0)),
                     "timing/slow_packets": len(train_cache.key_timestamps),
                 },
                 step=step,
@@ -545,11 +681,7 @@ def main() -> None:
             )
 
         if step % args.eval_interval == 0 or step == args.steps - 1:
-            eval_indices = (
-                np.asarray(val_pool, dtype=np.int64)
-                if step == args.steps - 1
-                else fixed_eval_indices
-            )
+            eval_indices = np.asarray(val_pool, dtype=np.int64) if step == args.steps - 1 else fixed_eval_indices
             totals: list[tuple[int, dict]] = []
             for start in range(0, len(eval_indices), args.batch_size):
                 batch_indices = eval_indices[start : start + args.batch_size]
@@ -565,19 +697,23 @@ def main() -> None:
                 totals.append((len(batch_indices), {"loss": loss, **parts}))
             total_examples = sum(count for count, _ in totals)
             val_metrics = {
-                f"val/{name}": sum(
-                    count * float(jax.device_get(item[name])) for count, item in totals
-                )
-                / total_examples
+                f"val/{name}": sum(count * float(jax.device_get(item[name])) for count, item in totals) / total_examples
                 for name in totals[0][1]
             }
             # Both baselines are step-0 only, to match the unweighted step-0 losses.
-            zero_residual_mse = float(np.mean(np.square(val_arrays.residual_pose[eval_indices, 0])))
-            reference_only_mse = float(
-                np.mean(
-                    np.square(
-                        val_cache.reference_actions[eval_indices, 0, : config.pose_dims]
-                        - val_arrays.full_pose[eval_indices, 0]
+            eval_target = val_arrays.residual_pose[eval_indices]
+            if args.single_head_total_target:
+                eval_target = eval_target + _staleness(val_arrays, val_cache, eval_indices)
+            zero_residual_mse = float(np.mean(np.square(eval_target[:, 0])))
+            reference_only_mse = (
+                zero_residual_mse
+                if args.single_head_total_target
+                else float(
+                    np.mean(
+                        np.square(
+                            val_cache.reference_actions[eval_indices, 0, : config.pose_dims]
+                            - val_arrays.full_pose[eval_indices, 0]
+                        )
                     )
                 )
             )
@@ -589,9 +725,7 @@ def main() -> None:
             if config.predict_staleness:
                 # Emitting zero is what the single-head student effectively did, so this
                 # is the baseline the staleness head has to beat to be worth its capacity.
-                zero_staleness_mse = float(
-                    np.mean(np.square(_staleness(val_arrays, val_cache, eval_indices)[:, 0]))
-                )
+                zero_staleness_mse = float(np.mean(np.square(_staleness(val_arrays, val_cache, eval_indices)[:, 0])))
                 val_metrics["val/zero_staleness_mse"] = zero_staleness_mse
                 val_metrics["val/staleness_gain_vs_zero"] = 1.0 - val_metrics["val/staleness_loss_step0"] / max(
                     zero_staleness_mse, 1e-12

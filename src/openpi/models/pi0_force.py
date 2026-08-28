@@ -550,6 +550,47 @@ class Pi0_Guidance(_model.BaseModel):
         )
         return full, null, prefix_out_fix, prefix_mask
 
+    def sample_paired_actions_from_cached_context(
+        self,
+        rng: at.KeyArrayLike,
+        context_observation: _model.Observation,
+        control_observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Array | None = None,
+    ):
+        """Query full/null modes with an older visual-language prefix and current control inputs.
+
+        ``context_observation`` supplies only the vision-language prefix associated
+        with the active Slow packet ``k``. ``control_observation`` supplies the
+        current state and timestamp-causal force history at residual-query time
+        ``t``. This makes offline Teacher targets measurable from exactly the
+        information available to the deployed Fast student, rather than leaking the
+        unseen current image ``V_t`` into its supervision.
+        """
+        if self.null_force_token is None:
+            raise ValueError("Cached-context paired sampling requires a learned null_force_token")
+        context_observation = _model.preprocess_observation(None, context_observation, train=False)
+        control_observation = _model.preprocess_observation(None, control_observation, train=False)
+        prefix_tokens, prefix_mask, prefix_out_fix, kv_cache = self._prepare_action_prefix(context_observation)
+        if context_observation.state.shape[0] != control_observation.state.shape[0]:
+            raise ValueError("Context and control observations must have the same batch size")
+        kwargs = {
+            "num_steps": num_steps,
+            "prefix_tokens": prefix_tokens,
+            "prefix_mask": prefix_mask,
+            "prefix_out_fix": prefix_out_fix,
+            "kv_cache": kv_cache,
+            "noise": noise,
+        }
+        full = self._sample_actions_with_prefix(
+            rng, control_observation, force_condition="full", **kwargs
+        )
+        null = self._sample_actions_with_prefix(
+            rng, control_observation, force_condition="null", **kwargs
+        )
+        return full, null, prefix_out_fix, prefix_mask
+
     def _prepare_action_prefix(self, observation: _model.Observation):
         """Encode vision/language once for both action sampling and cached intent."""
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)

@@ -56,10 +56,13 @@ def _load_model(checkpoint: pathlib.Path, *, chunk_steps: int, force_blind_stale
     """
     params = model_lib.restore_params(checkpoint)
     predicts_staleness = "staleness_head" in params.get("fast_student", {})
+    metadata = _run_metadata(checkpoint)
+    decoder_type = metadata.get("config", {}).get("decoder_type", "set_transformer")
     config = slow_fast.FastResidualConfig(
         chunk_steps=chunk_steps,
         predict_staleness=predicts_staleness,
         force_blind_staleness=force_blind_staleness,
+        decoder_type=decoder_type,
     )
     model = slow_fast.FastStudentWithIntentProjector(config, slow_context_dim=2048, rngs=nnx.Rngs(0))
     state = nnx.state(model, nnx.Param)
@@ -139,9 +142,7 @@ def _predict_all(model, arrays, cache, *, batch_size: int, seed: int):
                 staleness_parts[name].append(np.asarray(staleness))
     residuals = {name: np.concatenate(parts) for name, parts in predictions.items()}
     staleness = (
-        {name: np.concatenate(parts) for name, parts in staleness_parts.items()}
-        if staleness_parts["full"]
-        else None
+        {name: np.concatenate(parts) for name, parts in staleness_parts.items()} if staleness_parts["full"] else None
     )
     return residuals, staleness
 
@@ -374,6 +375,7 @@ def main() -> None:
         wrench_by_row,
         baseline_by_row,
         predicts_staleness=predicts_staleness,
+        target_mode=metadata.get("target_mode", "decomposed"),
         analytic_rebase=bool(metadata.get("analytic_rebase", False)),
         contact_threshold_n=args.contact_threshold_n,
         baseline_rows=args.baseline_rows,
@@ -398,6 +400,7 @@ def evaluate(
     baseline_by_row,
     *,
     predicts_staleness: bool,
+    target_mode: str = "decomposed",
     analytic_rebase: bool = False,
     contact_threshold_n: float,
     baseline_rows: int,
@@ -413,6 +416,8 @@ def evaluate(
     ready = np.flatnonzero(cache.row_ready) if cache.row_ready is not None else np.arange(len(arrays.dataset_indices))
     if len(ready) == 0:
         raise ValueError("Slow cache has no rows whose packet would already be ready")
+    if target_mode not in ("decomposed", "single_head_total"):
+        raise ValueError(f"Unknown Fast target mode: {target_mode}")
     # Kept before the row subset: the Slow reference is a delta from the state of
     # its *key* row, which is generally not one of the rows being scored.
     state_by_row = np.asarray(arrays.state)
@@ -427,12 +432,26 @@ def evaluate(
         row_key_positions=cache.row_key_positions[ready],
         row_ready=np.ones(len(ready), dtype=bool) if cache.row_ready is not None else None,
     )
+    action_scale = (np.asarray(norm_stats["actions"].std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(
+        np.float32
+    )
+    state_scale = (np.asarray(norm_stats["state"].std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(
+        np.float32
+    )
+    key_states = state_by_row[cache.key_dataset_indices[cache.row_key_positions]][:, : rot.POSE_DIMS]
+    rebase = (state_scale / action_scale) * (arrays.state[:, : rot.POSE_DIMS] - key_states)
+    normalized_staleness_target_chunk = (
+        arrays.null_pose - cache.reference_actions[:, :, : rot.POSE_DIMS].astype(np.float32) + rebase[:, None, :]
+    )
+    output_target_chunk = arrays.residual_pose
+    if target_mode == "single_head_total":
+        output_target_chunk = output_target_chunk + normalized_staleness_target_chunk
     chunk_predictions, chunk_staleness = _predict_all(model, arrays, cache, batch_size=batch_size, seed=seed)
     # Every step of the emitted chunk is scored, but the detailed pose report is on
     # step 0: that is the one that executes whenever Fast keeps up with the action rate.
     per_step_residual_mse = {
         name: [
-            float(np.mean(np.square(value[:, step] - arrays.residual_pose[:, step])))
+            float(np.mean(np.square(value[:, step] - output_target_chunk[:, step])))
             for step in range(cache.chunk_steps)
         ]
         for name, value in chunk_predictions.items()
@@ -461,7 +480,7 @@ def evaluate(
         "teacher_null": arrays.null_pose[:, 0],
         "expert": arrays.expert_pose[:, 0],
     }
-    normalized_residual_target = arrays.residual_pose[:, 0]
+    normalized_residual_target = output_target_chunk[:, 0]
     contact_summary: dict = {"available": False}
     strata: dict[str, np.ndarray] = {}
 
@@ -474,23 +493,14 @@ def evaluate(
     }
     # The residual is a difference of two deltas sharing one base, so it needs
     # only the scale, not the offset.
-    scale = (np.asarray(action_stats.std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(np.float32)
+    scale = action_scale
     physical_predictions = {name: value * scale for name, value in normalized_predictions.items()}
     normalized_staleness_target = None
     if normalized_staleness is not None:
         # The reference is a delta from its own key row's state, so the drift is not
         # `A_null - A_ref`: that difference is missing the base-state gap between the
         # two rows, which on the rotation coordinates is as large as the drift itself.
-        state_scale = (np.asarray(norm_stats["state"].std, dtype=np.float64)[: rot.POSE_DIMS] + 1e-6).astype(
-            np.float32
-        )
-        base_gap = arrays.state[:, : rot.POSE_DIMS] - state_by_row[cache.key_dataset_indices[cache.row_key_positions]][
-            :, : rot.POSE_DIMS
-        ]
-        rebase = (state_scale / scale) * base_gap
-        normalized_staleness_target = (
-            arrays.null_pose[:, 0] - cache.reference_actions[:, 0, : rot.POSE_DIMS].astype(np.float32) + rebase
-        )
+        normalized_staleness_target = normalized_staleness_target_chunk[:, 0]
         if analytic_rebase:
             # This run's head was trained on the drift alone, so the gap is supplied
             # here to put its numbers on the same target as every other run's. This is
@@ -526,11 +536,12 @@ def evaluate(
     if contact_summary["free_space_rows"]:
         strata["free_space"] = ~in_contact
 
-    metrics = {
+    return {
         "rows": len(normalized_residual_target),
         "action_units": {"translation": "metres", "rotation": "radians_geodesic"},
         "residual_mse_space": "normalized_pose_residual",
         "chunk_steps": cache.chunk_steps,
+        "target_mode": target_mode,
         "per_step_residual_mse_normalized": per_step_residual_mse,
         "predicts_staleness": predicts_staleness,
         "analytic_rebase": analytic_rebase,
@@ -566,7 +577,6 @@ def evaluate(
             },
         },
     }
-    return metrics
 
 
 if __name__ == "__main__":

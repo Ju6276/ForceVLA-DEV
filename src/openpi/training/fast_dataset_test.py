@@ -53,6 +53,25 @@ def test_load_stage3_fast_arrays_rejects_a_chunk_longer_than_the_horizon(tmp_pat
         fast_dataset.load_stage3_fast_arrays(tmp_path, chunk_steps=51)
 
 
+def test_cached_context_indices_are_explicit_and_current_targets_remain_backward_compatible(tmp_path):
+    _write_stage3(tmp_path)
+    assert fast_dataset.load_cached_context_dataset_indices(tmp_path) is None
+
+    shard_path = tmp_path / "shards" / "rows_000000_000002.npz"
+    with np.load(shard_path, allow_pickle=False) as shard:
+        arrays = {name: np.asarray(shard[name]) for name in shard.files}
+    arrays["context_dataset_indices"] = np.array([0, 0, 1], dtype=np.int64)
+    np.savez(shard_path, **arrays)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest["target_context_mode"] = "cached_slow_packet"
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    np.testing.assert_array_equal(
+        fast_dataset.load_cached_context_dataset_indices(tmp_path),
+        np.array([0, 0, 1]),
+    )
+
+
 def test_denormalize_inverts_z_score():
     stats = normalize.NormStats(mean=np.array([1.0, -2.0]), std=np.array([0.5, 4.0]))
     physical = np.array([[3.0, 6.0], [0.0, -2.0]], dtype=np.float32)

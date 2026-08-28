@@ -77,7 +77,7 @@ def benchmark_action_expert(args) -> tuple[float, np.ndarray]:
 
 def benchmark_fast_student(args) -> tuple[float, np.ndarray]:
     """Time the one deterministic forward the Fast student needs per command."""
-    config = slow_fast.FastResidualConfig(chunk_steps=args.chunk_steps)
+    config = slow_fast.FastResidualConfig(chunk_steps=args.chunk_steps, decoder_type=args.decoder_type)
     model = slow_fast.FastStudentWithIntentProjector(
         config,
         slow_context_dim=args.slow_context_dim,
@@ -133,6 +133,7 @@ def main() -> None:
     parser.add_argument("--chunk-steps", type=int, default=5)
     parser.add_argument("--context-tokens", type=int, default=16)
     parser.add_argument("--intent-tokens", type=int, default=2)
+    parser.add_argument("--decoder-type", choices=("set_transformer", "flash_gemma"), default="set_transformer")
     parser.add_argument("--slow-context-dim", type=int, default=2048)
     parser.add_argument("--force-window", type=int, default=10)
     parser.add_argument("--action-dims", type=int, default=10)

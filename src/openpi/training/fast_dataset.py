@@ -128,6 +128,35 @@ def load_stage3_fast_arrays(
     return Stage3FastArrays(**arrays)
 
 
+def load_cached_context_dataset_indices(target_dir: str | pathlib.Path) -> np.ndarray | None:
+    """Load the Slow-packet row bound to each cached-context Teacher target.
+
+    Current-observation Stage-3 targets predate this contract and return ``None``.
+    Cached-context targets must carry one context row per target row so training
+    can reject accidental schedule resampling or a mismatched Slow cache.
+    """
+    root = pathlib.Path(target_dir)
+    manifest = json.loads((root / "manifest.json").read_text())
+    mode = manifest.get("target_context_mode", "current_observation")
+    if mode == "current_observation":
+        return None
+    if mode != "cached_slow_packet":
+        raise ValueError(f"Unknown target_context_mode {mode!r} in {root}")
+    parts = []
+    for shard_info in manifest["shards"]:
+        if not shard_info.get("complete", False):
+            raise ValueError(f"Incomplete cached-context target shard: {shard_info}")
+        with np.load(root / shard_info["path"], allow_pickle=False) as shard:
+            if "context_dataset_indices" not in shard.files:
+                raise ValueError(f"Cached-context shard lacks context_dataset_indices: {shard_info['path']}")
+            parts.append(np.asarray(shard["context_dataset_indices"], dtype=np.int64))
+    result = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+    expected = int(manifest["extraction_size"])
+    if len(result) != expected:
+        raise ValueError(f"Expected {expected} cached-context rows, loaded {len(result)}")
+    return result
+
+
 def period_range_from_rates(rate_range_hz: tuple[float, float] | float | None) -> tuple[float, float] | None:
     """Convert a Slow rate band in Hz into the period band the selector expects."""
     if rate_range_hz is None:
